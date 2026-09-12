@@ -37,6 +37,13 @@ permissions:
 jobs:
   review:
     runs-on: ubuntu-latest
+    # One run per (repo, PR) at a time: two overlapping /review comments both
+    # read prior findings before either posts, and would otherwise post the
+    # same findings twice. Keyed on the caller's repo so this holds even
+    # though many consumer repos share this one reusable workflow.
+    concurrency:
+      group: ai-review-${{ github.repository }}-${{ github.event.issue.number }}
+      cancel-in-progress: true
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       MODEL: ${{ inputs.model }}
