@@ -64,9 +64,11 @@ re-review (only the incremental diff since the last review is sent).
 
 - Treat PR diffs as untrusted input — a diff can contain text aimed at the
   model. The reusable workflow never checks out a PR's own commits as its
-  working tree (only fetches the objects, for diffing); it always runs
-  `.github/scripts/*.sh` from the calling repo's default branch, so a PR
-  can't rewrite the reviewer to exfiltrate secrets.
+  working tree (only fetches the objects, for diffing); the scripts it runs
+  always come from a separate checkout of this repo's own `main` branch, so
+  a PR can't rewrite the reviewer to exfiltrate secrets. `main` is a floating
+  ref, not a pinned tag/SHA — consider tagging a release once this stabilizes
+  and pinning consumers' `uses:` and this checkout to it together.
 - Size caps in `build-diff.sh` budget whole files rather than truncating —
   a cut-off hunk gives the model a fragment it hallucinates about or anchors
   a comment to a line that doesn't exist. Generated/lockfile diffs are

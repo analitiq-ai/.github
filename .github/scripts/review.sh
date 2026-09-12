@@ -38,9 +38,19 @@ SCHEMA='{"type":"json_schema","json_schema":{"name":"review","strict":true,"sche
       "severity":{"type":"string","enum":["critical","major","minor"]},
       "body":{"type":"string"}}}}}}}}'
 
+# SYS_FULL tells the model no prior findings exist; keep that true by never
+# handing it prior.json, even though the fetch step always runs (a
+# "/review full" re-review of a PR with prior bot comments would otherwise
+# get a PRIOR_FINDINGS block that contradicts the system prompt).
+if [ "$MODE" = incremental ]; then
+  PRIOR_JSON="$(cat /tmp/prior.json 2>/dev/null || echo '[]')"
+else
+  PRIOR_JSON='[]'
+fi
+
 jq -n --arg m "$MODEL" --arg s "$SYS" \
       --arg d "$(cat /tmp/diff.txt)" \
-      --arg p "$(cat /tmp/prior.json 2>/dev/null || echo '[]')" \
+      --arg p "$PRIOR_JSON" \
       --argjson f "$SCHEMA" '{
   model:$m, response_format:$f,
   messages:[{role:"system",content:$s},
