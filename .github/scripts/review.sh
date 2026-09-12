@@ -57,6 +57,19 @@ jq -n --arg m "$MODEL" --arg s "$SYS" \
             {role:"user",content:("PRIOR_FINDINGS:\n"+$p+"\n\nDIFF:\n"+$d)}]
 }' > /tmp/req.json
 
+: "${COMMENT_ID:?COMMENT_ID (the id of the triggering comment) is required}"
+
+# A failure here is otherwise only visible as a red Actions run — post it as
+# a normal PR comment too, so the commenter isn't left guessing whether
+# /review did anything.
+post_failure_comment() {
+  local reason="$1" excerpt
+  excerpt="$(head -c 2000 /tmp/response.json 2>/dev/null)"
+  jq -n --arg reason "$reason" --arg body "${excerpt:-<no response body>}" \
+    '{body: ("**AI review did not run** — " + $reason + ".\n\n```\n" + $body + "\n```")}' \
+    | gh api "repos/$REPO/issues/$PR/comments" -X POST --input - > /dev/null 2>&1 || true
+}
+
 set +e
 curl -sS --fail-with-body https://openrouter.ai/api/v1/chat/completions \
   -H "Authorization: Bearer $OR_KEY" -H "Content-Type: application/json" \
@@ -67,12 +80,20 @@ set -e
 if [ "$CURL_STATUS" -ne 0 ]; then
   echo "::error::OpenRouter request failed (curl exit $CURL_STATUS):"
   cat /tmp/response.json >&2 || true
+  post_failure_comment "the OpenRouter request failed (curl exit $CURL_STATUS)"
   exit "$CURL_STATUS"
 fi
+
+# OpenRouter didn't reject the request outright (no HTTP-level error) — ack
+# the trigger comment now, before spending time validating/posting the
+# actual review, so the commenter knows /review was picked up. Best-effort:
+# a reaction failing here shouldn't fail an otherwise-working review.
+gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions" -f content=eyes > /dev/null 2>&1 || true
 
 if ! jq -e '.choices[0].message.content' /tmp/response.json > /dev/null 2>&1; then
   echo "::error::OpenRouter response missing choices[0].message.content:"
   cat /tmp/response.json >&2
+  post_failure_comment "OpenRouter's response didn't include a usable result"
   exit 1
 fi
 

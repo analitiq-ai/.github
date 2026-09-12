@@ -32,6 +32,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
   pull-requests: write
 
 jobs:
@@ -110,6 +111,7 @@ jobs:
       - name: Review
         env:
           OR_KEY: ${{ secrets.OPEN_ROUTER_KEY }}
+          COMMENT_ID: ${{ github.event.comment.id }}
         run: _reviewer/.github/scripts/review.sh "${{ steps.base.outputs.mode }}"
 
       - name: Post

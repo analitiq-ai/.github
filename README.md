@@ -53,12 +53,18 @@ re-review (only the incremental diff since the last review is sent).
 ### The loop
 
 ```
-/review            → inline findings + summary + hidden SHA
+/review            → 👀 once OpenRouter accepts the request, then
+                     inline findings + summary + hidden SHA
   ↓  you fix, push
 /review            → diffs only the fix commits; marks prior findings
                      RESOLVED / NOT_ADDRESSED / PARTIALLY_ADDRESSED; flags anything new
 /review full       → fresh whole-PR pass when incremental has drifted
 ```
+
+No 👀 and no review within a minute or so means something failed before
+OpenRouter was even reached (bad diff, missing secret) — check the run. If
+OpenRouter itself rejected the request (no credits, bad key, model slug typo'd),
+a PR comment says so directly instead of leaving only a red Actions run.
 
 ### Operating notes
 
