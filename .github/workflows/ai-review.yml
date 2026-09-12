@@ -1,0 +1,69 @@
+name: AI Review (reusable)
+
+# Called via `uses:` from a thin per-repo workflow triggered on `issue_comment`.
+# That caller is the trust boundary: it gates on the commenter's login before
+# ever invoking this job. This job never checks out the PR's own commits as
+# its working tree — only the calling repo's default branch is checked out,
+# so `.github/scripts/*.sh` below always run the version the repo owner
+# committed, never a version a PR author could have replaced.
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: OpenRouter model slug to use for the review
+        required: false
+        type: string
+        default: moonshotai/kimi-k2.5
+    secrets:
+      OPEN_ROUTER_KEY:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      OR_KEY: ${{ secrets.OPEN_ROUTER_KEY }}
+      MODEL: ${{ inputs.model }}
+      PR: ${{ github.event.issue.number }}
+      REPO: ${{ github.repository }}
+
+    steps:
+      - name: Checkout default branch (trusted scripts only)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch PR head (objects only, never checked out)
+        id: fetch_pr
+        run: |
+          git fetch origin "pull/${PR}/head:pr_head"
+          echo "head=$(git rev-parse pr_head)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve base
+        id: base
+        env:
+          HEAD_SHA: ${{ steps.fetch_pr.outputs.head }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: .github/scripts/resolve-base.sh
+
+      - name: Build diff
+        run: .github/scripts/build-diff.sh "${{ steps.base.outputs.sha }}" "${{ steps.fetch_pr.outputs.head }}"
+
+      - name: Prior findings
+        run: |
+          gh api "repos/$REPO/pulls/$PR/comments" \
+            --jq '[.[] | select(.user.login=="github-actions[bot]")
+                   | {path, line, body}]' > /tmp/prior.json
+
+      - name: Review
+        run: .github/scripts/review.sh "${{ steps.base.outputs.mode }}"
+
+      - name: Post
+        run: .github/scripts/post.sh "${{ steps.fetch_pr.outputs.head }}"
