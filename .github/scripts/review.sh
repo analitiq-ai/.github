@@ -64,10 +64,15 @@ jq -n --arg m "$MODEL" --arg s "$SYS" \
 # /review did anything.
 post_failure_comment() {
   local reason="$1" excerpt
-  excerpt="$(head -c 2000 /tmp/response.json 2>/dev/null)"
+  # `|| true` matters: curl never creates the -o file when it fails before
+  # receiving a body at all (DNS/connection/TLS failure), so head errors —
+  # and under set -e that would kill this function before jq/gh ever run,
+  # silently skipping the one comment this whole function exists to post.
+  excerpt="$(head -c 2000 /tmp/response.json 2>/dev/null || true)"
   jq -n --arg reason "$reason" --arg body "${excerpt:-<no response body>}" \
     '{body: ("**AI review did not run** — " + $reason + ".\n\n```\n" + $body + "\n```")}' \
-    | gh api "repos/$REPO/issues/$PR/comments" -X POST --input - > /dev/null 2>&1 || true
+    | gh api "repos/$REPO/issues/$PR/comments" -X POST --input - > /dev/null \
+    || echo "::warning::couldn't post the failure comment (check issues: write on the caller)"
 }
 
 set +e
@@ -87,11 +92,13 @@ fi
 # OpenRouter didn't reject the request outright (no HTTP-level error) — ack
 # the trigger comment now, before spending time validating/posting the
 # actual review, so the commenter knows /review was picked up. Best-effort:
-# a reaction failing here shouldn't fail an otherwise-working review.
-gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions" -f content=eyes > /dev/null 2>&1 || true
+# a reaction failing here shouldn't fail an otherwise-working review, but it
+# still needs to say why instead of just silently not appearing.
+gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions" -f content=eyes > /dev/null \
+  || echo "::warning::couldn't add the 👀 reaction (check issues: write on the caller)"
 
-if ! jq -e '.choices[0].message.content' /tmp/response.json > /dev/null 2>&1; then
-  echo "::error::OpenRouter response missing choices[0].message.content:"
+if ! jq -e '.choices[0].message.content | strings | select(length > 0)' /tmp/response.json > /dev/null 2>&1; then
+  echo "::error::OpenRouter response missing a non-empty choices[0].message.content:"
   cat /tmp/response.json >&2
   post_failure_comment "OpenRouter's response didn't include a usable result"
   exit 1

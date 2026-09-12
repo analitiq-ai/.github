@@ -31,6 +31,7 @@ re-review (only the incremental diff since the last review is sent).
 
    permissions:
      contents: read
+     issues: write
      pull-requests: write
 
    jobs:
@@ -40,10 +41,17 @@ re-review (only the incremental diff since the last review is sent).
          github.event.comment.user.login == 'Analitiq-Bot' &&
          startsWith(github.event.comment.body, '/review')
        uses: analitiq-ai/.github/.github/workflows/ai-review.yml@main
-       secrets: inherit
+       secrets:
+         OPEN_ROUTER_KEY: ${{ secrets.OPEN_ROUTER_KEY }}
        # with:
        #   model: moonshotai/kimi-k2-thinking   # override the default below
    ```
+
+   `issues: write` is required, not optional: the reusable workflow's own
+   `permissions:` can only narrow what its caller grants, never widen it, and
+   the eyes-reaction/failure-comment ack (below) posts through Issues-API
+   endpoints that `pull-requests: write` doesn't cover. Without it the ack
+   silently never appears — the call is best-effort and won't fail the run.
 
    The `if:` is the actual security boundary: on a public repo, anyone can
    comment `/review` on a PR, so the job only runs when the comment's author
@@ -61,10 +69,14 @@ re-review (only the incremental diff since the last review is sent).
 /review full       → fresh whole-PR pass when incremental has drifted
 ```
 
-No 👀 and no review within a minute or so means something failed before
-OpenRouter was even reached (bad diff, missing secret) — check the run. If
-OpenRouter itself rejected the request (no credits, bad key, model slug typo'd),
-a PR comment says so directly instead of leaving only a red Actions run.
+The 👀 is best-effort (a missing `issues: write` on the caller drops it
+silently, logged only as an Actions `::warning::`) — treat its absence as a
+hint, not proof of failure. No 👀 and no review within a minute or so usually
+means something failed before OpenRouter was reached (bad diff, missing
+secret, missing permission) — check the run. If OpenRouter itself rejected
+the request (no credits, bad key, model slug typo'd) or returned something
+unusable, a PR comment says so directly instead of leaving only a red
+Actions run.
 
 ### Operating notes
 
