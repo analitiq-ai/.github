@@ -1,0 +1,115 @@
+name: AI Review (reusable)
+
+# Called via `uses:` from a thin per-repo workflow triggered on `issue_comment`.
+# That caller's `if:` is the primary gate; the "Verify trusted commenter" step
+# below re-asserts the same check here, so the invariant has one definition
+# instead of living only as a copy-pasted convention in every consumer repo.
+#
+# Two checkouts, on purpose: the review scripts come from a checkout of THIS
+# repo — `github.repository`/the default checkout target inside a called
+# workflow resolves to the CALLING repo, not this one, so the scripts must be
+# fetched explicitly. The calling repo's PR commits are fetched as git objects
+# only, never checked out as a working tree, so nothing from the PR is ever
+# executed.
+#
+# Order matters: the root checkout must run FIRST. actions/checkout treats an
+# existing-but-not-a-git-repo target directory as stale and wipes it before
+# cloning; checking out into `_reviewer/` before the root checkout would have
+# the root checkout (which defaults to the workspace root) delete `_reviewer/`
+# out from under it.
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: OpenRouter model slug to use for the review
+        required: false
+        type: string
+        default: moonshotai/kimi-k2.5
+    secrets:
+      OPEN_ROUTER_KEY:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    # One run per (repo, PR) at a time: two overlapping /review comments both
+    # read prior findings before either posts, and would otherwise post the
+    # same findings twice. Keyed on the caller's repo so this holds even
+    # though many consumer repos share this one reusable workflow.
+    concurrency:
+      group: ai-review-${{ github.repository }}-${{ github.event.issue.number }}
+      cancel-in-progress: true
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      MODEL: ${{ inputs.model }}
+      PR: ${{ github.event.issue.number }}
+      REPO: ${{ github.repository }}
+
+    steps:
+      - name: Verify trusted commenter and required context
+        env:
+          COMMENTER: ${{ github.event.comment.user.login }}
+          IS_PR_COMMENT: ${{ github.event.issue.pull_request != null }}
+        run: |
+          if [ "$COMMENTER" != 'Analitiq-Bot' ]; then
+            echo "::error::ai-review invoked by untrusted commenter '$COMMENTER'"
+            exit 1
+          fi
+          if [ "$IS_PR_COMMENT" != 'true' ]; then
+            echo "::error::ai-review invoked on a non-PR issue comment"
+            exit 1
+          fi
+          : "${PR:?PR (issue number) is required — was this triggered by an issue_comment event on a PR?}"
+          : "${REPO:?REPO is required}"
+
+      - name: Checkout calling repo's default branch (for diffing only)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout review scripts (never the caller's tree)
+        uses: actions/checkout@v4
+        with:
+          repository: analitiq-ai/.github
+          ref: main
+          path: _reviewer
+
+      - name: Fetch PR head (objects only, never checked out)
+        id: fetch_pr
+        run: |
+          git fetch origin "pull/${PR}/head:pr_head"
+          echo "head=$(git rev-parse pr_head)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve base
+        id: base
+        env:
+          HEAD_SHA: ${{ steps.fetch_pr.outputs.head }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: _reviewer/.github/scripts/resolve-base.sh
+
+      - name: Build diff
+        run: _reviewer/.github/scripts/build-diff.sh "${{ steps.base.outputs.sha }}" "${{ steps.fetch_pr.outputs.head }}"
+
+      - name: Prior findings
+        run: |
+          # --slurp wraps every page's array in one outer array, so the jq
+          # filter flattens with `.[][]` — without it, --jq runs per page and
+          # `/tmp/prior.json` ends up as several concatenated arrays instead
+          # of one, once a PR passes 100 prior inline comments.
+          gh api --paginate --slurp "repos/$REPO/pulls/$PR/comments?per_page=100" \
+            --jq '[.[][] | select(.user.login=="github-actions[bot]")
+                   | {path, line, body}]' > /tmp/prior.json
+
+      - name: Review
+        env:
+          OR_KEY: ${{ secrets.OPEN_ROUTER_KEY }}
+        run: _reviewer/.github/scripts/review.sh "${{ steps.base.outputs.mode }}"
+
+      - name: Post
+        run: _reviewer/.github/scripts/post.sh "${{ steps.fetch_pr.outputs.head }}"
