@@ -1,11 +1,16 @@
 name: AI Review (reusable)
 
 # Called via `uses:` from a thin per-repo workflow triggered on `issue_comment`.
-# That caller is the trust boundary: it gates on the commenter's login before
-# ever invoking this job. This job never checks out the PR's own commits as
-# its working tree — only the calling repo's default branch is checked out,
-# so `.github/scripts/*.sh` below always run the version the repo owner
-# committed, never a version a PR author could have replaced.
+# That caller's `if:` is the primary gate; the "Verify trusted commenter" step
+# below re-asserts the same check here, so the invariant has one definition
+# instead of living only as a copy-pasted convention in every consumer repo.
+#
+# Two checkouts, on purpose: the review scripts come from a pinned checkout of
+# THIS repo — `github.repository`/the default checkout target inside a called
+# workflow resolves to the CALLING repo, not this one, so the scripts must be
+# fetched explicitly. The calling repo's PR commits are fetched as git objects
+# only, never checked out as a working tree, so nothing from the PR is ever
+# executed.
 
 on:
   workflow_call:
@@ -28,13 +33,30 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      OR_KEY: ${{ secrets.OPEN_ROUTER_KEY }}
       MODEL: ${{ inputs.model }}
       PR: ${{ github.event.issue.number }}
       REPO: ${{ github.repository }}
 
     steps:
-      - name: Checkout default branch (trusted scripts only)
+      - name: Verify trusted commenter and required context
+        env:
+          COMMENTER: ${{ github.event.comment.user.login }}
+        run: |
+          if [ "$COMMENTER" != 'Analitiq-Bot' ]; then
+            echo "::error::ai-review invoked by untrusted commenter '$COMMENTER'"
+            exit 1
+          fi
+          : "${PR:?PR (issue number) is required — was this triggered by an issue_comment event on a PR?}"
+          : "${REPO:?REPO is required}"
+
+      - name: Checkout review scripts (pinned, never the caller's tree)
+        uses: actions/checkout@v4
+        with:
+          repository: analitiq-ai/.github
+          ref: main
+          path: _reviewer
+
+      - name: Checkout calling repo's default branch (for diffing only)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -51,19 +73,21 @@ jobs:
           HEAD_SHA: ${{ steps.fetch_pr.outputs.head }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: .github/scripts/resolve-base.sh
+        run: _reviewer/.github/scripts/resolve-base.sh
 
       - name: Build diff
-        run: .github/scripts/build-diff.sh "${{ steps.base.outputs.sha }}" "${{ steps.fetch_pr.outputs.head }}"
+        run: _reviewer/.github/scripts/build-diff.sh "${{ steps.base.outputs.sha }}" "${{ steps.fetch_pr.outputs.head }}"
 
       - name: Prior findings
         run: |
-          gh api "repos/$REPO/pulls/$PR/comments" \
+          gh api --paginate "repos/$REPO/pulls/$PR/comments?per_page=100" \
             --jq '[.[] | select(.user.login=="github-actions[bot]")
                    | {path, line, body}]' > /tmp/prior.json
 
       - name: Review
-        run: .github/scripts/review.sh "${{ steps.base.outputs.mode }}"
+        env:
+          OR_KEY: ${{ secrets.OPEN_ROUTER_KEY }}
+        run: _reviewer/.github/scripts/review.sh "${{ steps.base.outputs.mode }}"
 
       - name: Post
-        run: .github/scripts/post.sh "${{ steps.fetch_pr.outputs.head }}"
+        run: _reviewer/.github/scripts/post.sh "${{ steps.fetch_pr.outputs.head }}"
