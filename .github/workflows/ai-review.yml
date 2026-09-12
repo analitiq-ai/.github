@@ -98,13 +98,14 @@ jobs:
 
       - name: Prior findings
         run: |
-          # --slurp wraps every page's array in one outer array, so the jq
-          # filter flattens with `.[][]` — without it, --jq runs per page and
-          # `/tmp/prior.json` ends up as several concatenated arrays instead
-          # of one, once a PR passes 100 prior inline comments.
-          gh api --paginate --slurp "repos/$REPO/pulls/$PR/comments?per_page=100" \
-            --jq '[.[][] | select(.user.login=="github-actions[bot]")
-                   | {path, line, body}]' > /tmp/prior.json
+          # gh api rejects --paginate --slurp combined with --jq outright, so
+          # --paginate alone (each page's array printed as its own JSON
+          # document) plus a separate `jq -s` (slurp) is what actually
+          # combines every page into one array — flattened with `.[][]`,
+          # same as if --jq had run once over the whole paginated result.
+          gh api --paginate "repos/$REPO/pulls/$PR/comments?per_page=100" > /tmp/prior-raw.jsonl
+          jq -s '[.[][] | select(.user.login=="github-actions[bot]")
+                  | {path, line, body}]' /tmp/prior-raw.jsonl > /tmp/prior.json
 
       - name: Review
         env:
