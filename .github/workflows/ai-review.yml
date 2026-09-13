@@ -17,6 +17,11 @@ name: AI Review (reusable)
 # cloning; checking out into `_reviewer/` before the root checkout would have
 # the root checkout (which defaults to the workspace root) delete `_reviewer/`
 # out from under it.
+#
+# The model's read_file/grep/list_files tools (.github/scripts/tools.sh) are
+# read-only git plumbing (git show/grep/ls-tree) against the PR's head SHA —
+# they surface file content, never execute anything, so the no-PR-code-
+# execution property above holds for tool use too.
 
 on:
   workflow_call:
@@ -112,6 +117,7 @@ jobs:
         env:
           OR_KEY: ${{ secrets.OPEN_ROUTER_KEY }}
           COMMENT_ID: ${{ github.event.comment.id }}
+          PR_HEAD: ${{ steps.fetch_pr.outputs.head }}
         run: _reviewer/.github/scripts/review.sh "${{ steps.base.outputs.mode }}"
 
       - name: Post

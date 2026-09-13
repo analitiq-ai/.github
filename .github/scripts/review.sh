@@ -1,12 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 : "${OR_KEY:?OPEN_ROUTER_KEY secret is required}"
+: "${COMMENT_ID:?COMMENT_ID (the id of the triggering comment) is required}"
 MODE="$1"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tools.sh
+source "$SCRIPT_DIR/tools.sh"
+
+MAX_TOOL_ROUNDS=6
 
 SYS_COMMON='Every comment'"'"'s "line" must be the new-file line number exactly as
 you can count it in the unified diff below (the right-hand/"+" side) — never a
 line number from any other view of the file. Only comment on a line that is
-literally present in the diff text.'
+literally present in the diff text.
+
+You have read-only tools — read_file, grep, list_files — against the PR'"'"'s
+own head commit. The diff alone cannot carry repo-wide convention: whether a
+referenced field exists, whether a naming rule holds elsewhere, what a
+function you did not see the definition of actually does. Call a tool before
+asserting a claim like that, rather than guessing from the diff text alone.
+Do not call a tool for anything already fully visible in the diff.'
 
 SYS_FULL="You are a senior code reviewer. Report only real bugs, security issues,
 and correctness problems. No style nits, no praise. There are no prior findings to
@@ -48,16 +62,10 @@ else
   PRIOR_JSON='[]'
 fi
 
-jq -n --arg m "$MODEL" --arg s "$SYS" \
-      --arg d "$(cat /tmp/diff.txt)" \
-      --arg p "$PRIOR_JSON" \
-      --argjson f "$SCHEMA" '{
-  model:$m, response_format:$f,
-  messages:[{role:"system",content:$s},
-            {role:"user",content:("PRIOR_FINDINGS:\n"+$p+"\n\nDIFF:\n"+$d)}]
-}' > /tmp/req.json
-
-: "${COMMENT_ID:?COMMENT_ID (the id of the triggering comment) is required}"
+jq -n --arg s "$SYS" --arg d "$(cat /tmp/diff.txt)" --arg p "$PRIOR_JSON" '
+  [{role:"system",content:$s},
+   {role:"user",content:("PRIOR_FINDINGS:\n"+$p+"\n\nDIFF:\n"+$d)}]' \
+  > /tmp/messages.json
 
 # A failure here is otherwise only visible as a red Actions run — post it as
 # a normal PR comment too, so the commenter isn't left guessing whether
@@ -75,27 +83,96 @@ post_failure_comment() {
     || echo "::warning::couldn't post the failure comment (check issues: write on the caller)"
 }
 
-set +e
-curl -sS --fail-with-body https://openrouter.ai/api/v1/chat/completions \
-  -H "Authorization: Bearer $OR_KEY" -H "Content-Type: application/json" \
-  -d @/tmp/req.json -o /tmp/response.json
-CURL_STATUS=$?
-set -e
+REACTED=""
+ack_once() {
+  [ -n "$REACTED" ] && return 0
+  # OpenRouter didn't reject the request outright (no HTTP-level error) — ack
+  # the trigger comment now, before spending time investigating/posting the
+  # actual review, so the commenter knows /review was picked up. Best-effort:
+  # a reaction failing here shouldn't fail an otherwise-working review, but it
+  # still needs to say why instead of just silently not appearing.
+  gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions" -f content=eyes > /dev/null \
+    || echo "::warning::couldn't add the 👀 reaction (check issues: write on the caller)"
+  REACTED=1
+}
 
-if [ "$CURL_STATUS" -ne 0 ]; then
-  echo "::error::OpenRouter request failed (curl exit $CURL_STATUS):"
-  cat /tmp/response.json >&2 || true
-  post_failure_comment "the OpenRouter request failed (curl exit $CURL_STATUS)"
-  exit "$CURL_STATUS"
+# Sends the current /tmp/messages.json as one chat-completions call.
+# $1: extra top-level JSON object merged into the request (tools, or
+# response_format for the final structuring call). Writes /tmp/response.json
+# and returns curl's exit status; does not itself post a failure comment or
+# exit, since a mid-loop failure and the final call's failure carry different
+# messages.
+call_openrouter() {
+  local extra="$1" status
+  jq -n --arg m "$MODEL" --argjson msgs "$(cat /tmp/messages.json)" --argjson extra "$extra" \
+    '{model:$m, messages:$msgs} + $extra' > /tmp/req.json
+  set +e
+  curl -sS --fail-with-body https://openrouter.ai/api/v1/chat/completions \
+    -H "Authorization: Bearer $OR_KEY" -H "Content-Type: application/json" \
+    -d @/tmp/req.json -o /tmp/response.json
+  status=$?
+  set -e
+  return "$status"
+}
+
+append_message() {
+  # $1: a JSON message object, as text
+  jq --argjson m "$1" '. + [$m]' /tmp/messages.json > /tmp/messages.json.tmp
+  mv /tmp/messages.json.tmp /tmp/messages.json
+}
+
+# Phase 1: let the model investigate with tools. No response_format here —
+# strict structured-output and multi-round tool calling aren't reliably
+# combinable across every OpenRouter-routed provider, so tool use runs
+# unconstrained and a separate final call (phase 2) forces the schema once
+# the model is done looking things up.
+round=0
+while [ "$round" -lt "$MAX_TOOL_ROUNDS" ]; do
+  round=$((round + 1))
+
+  if call_openrouter "$(jq -n --argjson t "$TOOLS_SCHEMA" '{tools:$t}')"; then
+    ack_once
+  else
+    curl_status=$?
+    echo "::error::OpenRouter request failed during investigation, round $round (curl exit $curl_status):"
+    cat /tmp/response.json >&2 || true
+    post_failure_comment "the OpenRouter request failed while investigating (round $round)"
+    exit 1
+  fi
+
+  TOOL_CALLS=$(jq -c '.choices[0].message.tool_calls // []' /tmp/response.json 2>/dev/null) || TOOL_CALLS="[]"
+  if [ "$TOOL_CALLS" = "[]" ] || [ "$TOOL_CALLS" = "null" ]; then
+    break
+  fi
+
+  append_message "$(jq -c '.choices[0].message' /tmp/response.json)"
+  while IFS= read -r call; do
+    [ -z "$call" ] && continue
+    call_id=$(jq -r '.id' <<<"$call")
+    fn=$(jq -c '.function' <<<"$call")
+    result=$(dispatch_tool_call "$fn")
+    append_message "$(jq -n --arg id "$call_id" --arg content "$result" '{role:"tool", tool_call_id:$id, content:$content}')"
+  done < <(jq -c '.[]' <<<"$TOOL_CALLS")
+done
+
+if [ "$round" -ge "$MAX_TOOL_ROUNDS" ]; then
+  append_message '{"role":"user","content":"You have reached the tool-call limit. Stop investigating and produce your final review now, from what you have already learned."}'
+else
+  append_message '{"role":"user","content":"You now have everything you asked for. Produce your final review now."}'
 fi
 
-# OpenRouter didn't reject the request outright (no HTTP-level error) — ack
-# the trigger comment now, before spending time validating/posting the
-# actual review, so the commenter knows /review was picked up. Best-effort:
-# a reaction failing here shouldn't fail an otherwise-working review, but it
-# still needs to say why instead of just silently not appearing.
-gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions" -f content=eyes > /dev/null \
-  || echo "::warning::couldn't add the 👀 reaction (check issues: write on the caller)"
+# Phase 2: one final call, schema-constrained, no tools — whatever the model
+# learned above is already in the conversation, so this call only has to
+# shape it into the structured verdict.
+if call_openrouter "$(jq -n --argjson f "$SCHEMA" '{response_format:$f}')"; then
+  ack_once
+else
+  curl_status=$?
+  echo "::error::OpenRouter request failed on the final structuring call (curl exit $curl_status):"
+  cat /tmp/response.json >&2 || true
+  post_failure_comment "the OpenRouter request failed while finalizing the review"
+  exit 1
+fi
 
 if ! jq -e '.choices[0].message.content | strings | select(length > 0)' /tmp/response.json > /dev/null 2>&1; then
   echo "::error::OpenRouter response missing a non-empty choices[0].message.content:"
