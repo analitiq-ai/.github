@@ -95,10 +95,15 @@ Actions run.
   the code you care about into the part of the context window where
   retrieval is weakest.
 - Pin the model in the caller's `with: model:` (defaults to
-  `moonshotai/kimi-k2.5`) — OpenRouter slugs move. If reviews feel shallow,
-  move to `moonshotai/kimi-k2-thinking` before touching the prompt; if
-  they're noisy, tighten `.github/scripts/review.sh`'s system prompt rather
-  than switching models — false positives are mostly a prompt-threshold
+  `z-ai/glm-5.3-flash` — chosen over kimi-k2.6 and kimi-k3 after running all
+  three against 5 historical PRs with the production prompt/schema and
+  checking every finding against the actual code: it matched kimi-k3's
+  real-finding rate at roughly 1/16th the cost, and kimi-k2.6 produced an
+  unparseable, budget-exhausting response on the largest diff) — OpenRouter
+  slugs move. If reviews feel shallow, try `moonshotai/kimi-k3` before
+  touching the prompt; if they're noisy, tighten
+  `.github/scripts/review.sh`'s system prompt rather than switching
+  models — false positives are mostly a prompt-threshold
   problem.
 - Pilot on a repo's historical PRs and count false positives before trusting
   it on live work.
