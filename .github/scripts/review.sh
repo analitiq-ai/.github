@@ -134,12 +134,26 @@ call_openrouter() {
 }
 
 append_message() {
-  # $1: a JSON message object, as text. Written to a file and read with
-  # --slurpfile rather than passed as --argjson — nothing caps how long an
-  # assistant turn's own content can run before it decides to call a tool
-  # (the benchmark that motivated this workflow saw one model emit ~1.85MB
-  # in a single turn), so the same argv-overflow risk applies here as
-  # everywhere else large content reaches jq in this script.
+  # $1: a JSON message object, as text. An empty $1 means the command
+  # substitution that produced it failed silently (e.g. `jq -c
+  # '.choices[0].message' response.json` on a 2xx response whose body isn't
+  # valid JSON — an upstream proxy page, a truncated stream) — `set -e`
+  # doesn't catch a failing substitution used as a plain argument, so that
+  # has to be checked explicitly, and checked before --slurpfile, which
+  # would otherwise turn an empty file into a silently-appended `null`
+  # rather than failing at all.
+  if [ -z "$1" ]; then
+    echo "::error::a response could not be parsed into a message (see the raw response below):"
+    cat /tmp/response.json >&2 || true
+    post_failure_comment "OpenRouter returned a response that couldn't be parsed"
+    exit 1
+  fi
+  # Written to a file and read with --slurpfile rather than passed as
+  # --argjson — nothing caps how long an assistant turn's own content can
+  # run before it decides to call a tool (the benchmark that motivated this
+  # workflow saw one model emit ~1.85MB in a single turn), so the same
+  # argv-overflow risk applies here as everywhere else large content
+  # reaches jq in this script.
   printf '%s' "$1" > /tmp/new_message.json
   jq --slurpfile m /tmp/new_message.json '. + [$m[0]]' /tmp/messages.json > /tmp/messages.json.tmp
   mv /tmp/messages.json.tmp /tmp/messages.json
