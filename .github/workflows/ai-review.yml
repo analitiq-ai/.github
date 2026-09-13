@@ -25,7 +25,7 @@ on:
         description: OpenRouter model slug to use for the review
         required: false
         type: string
-        default: moonshotai/kimi-k2.5
+        default: z-ai/glm-5.3-flash
     secrets:
       OPEN_ROUTER_KEY:
         required: true
