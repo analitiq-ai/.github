@@ -24,7 +24,16 @@ TOTAL=$(jq '.comments | length' /tmp/out.json)
 KEPT=$(jq 'length' /tmp/comments.json)
 echo "::notice::posting $KEPT/$TOTAL model-proposed inline comments (rest failed the diff-line-anchor check)"
 
-SUMMARY=$(jq -r '.summary' /tmp/out.json)
+# A genuinely clean review (nothing proposed, nothing to adjudicate from a
+# prior round) gets a fixed message rather than the model's own freeform
+# summary — "reviewed this diff, no bugs" reads differently every time
+# depending on wording the model chose, for a case with only one real
+# outcome to report.
+if [ "$TOTAL" -eq 0 ] && [ "$(jq '(.prior_findings // []) | length' /tmp/out.json)" -eq 0 ]; then
+  SUMMARY="Reviewed — no issues found."
+else
+  SUMMARY=$(jq -r '.summary' /tmp/out.json)
+fi
 PRIOR=$(jq -r '
   (.prior_findings // []) as $pf
   | if ($pf|length) > 0 then
