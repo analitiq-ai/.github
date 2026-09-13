@@ -56,15 +56,25 @@ SCHEMA='{"type":"json_schema","json_schema":{"name":"review","strict":true,"sche
 # handing it prior.json, even though the fetch step always runs (a
 # "/review full" re-review of a PR with prior bot comments would otherwise
 # get a PRIOR_FINDINGS block that contradicts the system prompt).
-if [ "$MODE" = incremental ]; then
-  PRIOR_JSON="$(cat /tmp/prior.json 2>/dev/null || echo '[]')"
+if [ "$MODE" = incremental ] && [ -s /tmp/prior.json ]; then
+  PRIOR_FILE=/tmp/prior.json
 else
-  PRIOR_JSON='[]'
+  echo '[]' > /tmp/prior_empty.json
+  PRIOR_FILE=/tmp/prior_empty.json
 fi
 
-jq -n --arg s "$SYS" --arg d "$(cat /tmp/diff.txt)" --arg p "$PRIOR_JSON" '
+# --rawfile/--slurpfile read straight from the filesystem rather than via an
+# argv-embedded `$(cat ...)` — a full-budget diff (build-diff.sh allows up to
+# ~100KB) plus accumulated tool output already exceeds Linux's ~128KB
+# per-argument limit later in the loop, and a jq call that dies from
+# "Argument list too long" leaves req.json truncated (often to empty) rather
+# than failing loudly, so curl posts garbage and the resulting error blames
+# OpenRouter for a local overflow. Every place a potentially large file's
+# content reaches jq in this script goes through one of these two, never
+# through --arg on a command substitution.
+jq -n --arg s "$SYS" --rawfile d /tmp/diff.txt --slurpfile p "$PRIOR_FILE" '
   [{role:"system",content:$s},
-   {role:"user",content:("PRIOR_FINDINGS:\n"+$p+"\n\nDIFF:\n"+$d)}]' \
+   {role:"user",content:("PRIOR_FINDINGS:\n"+($p[0]|tostring)+"\n\nDIFF:\n"+$d)}]' \
   > /tmp/messages.json
 
 # A failure here is otherwise only visible as a red Actions run — post it as
@@ -96,28 +106,42 @@ ack_once() {
   REACTED=1
 }
 
-# Sends the current /tmp/messages.json as one chat-completions call.
-# $1: extra top-level JSON object merged into the request (tools, or
+# Sends the current /tmp/messages.json as one chat-completions call, retrying
+# transient failures up to twice more (network blip, a 429/5xx) — going from
+# one call to as many as seven per review multiplies exposure to a transient
+# failure by the same factor, so absorbing it here matters more than it did
+# before. $1: extra top-level JSON object merged into the request (tools, or
 # response_format for the final structuring call). Writes /tmp/response.json
 # and returns curl's exit status; does not itself post a failure comment or
 # exit, since a mid-loop failure and the final call's failure carry different
 # messages.
 call_openrouter() {
-  local extra="$1" status
-  jq -n --arg m "$MODEL" --argjson msgs "$(cat /tmp/messages.json)" --argjson extra "$extra" \
-    '{model:$m, messages:$msgs} + $extra' > /tmp/req.json
-  set +e
-  curl -sS --fail-with-body https://openrouter.ai/api/v1/chat/completions \
-    -H "Authorization: Bearer $OR_KEY" -H "Content-Type: application/json" \
-    -d @/tmp/req.json -o /tmp/response.json
-  status=$?
-  set -e
+  local extra="$1" status attempt
+  jq --arg m "$MODEL" --argjson extra "$extra" '{model:$m, messages:.} + $extra' \
+    /tmp/messages.json > /tmp/req.json
+  for attempt in 1 2 3; do
+    set +e
+    curl -sS --fail-with-body https://openrouter.ai/api/v1/chat/completions \
+      -H "Authorization: Bearer $OR_KEY" -H "Content-Type: application/json" \
+      -H "HTTP-Referer: https://github.com/analitiq-ai" -H "X-Title: analitiq-ai /review" \
+      -d @/tmp/req.json -o /tmp/response.json
+    status=$?
+    set -e
+    [ "$status" -eq 0 ] && return 0
+    [ "$attempt" -lt 3 ] && sleep 3
+  done
   return "$status"
 }
 
 append_message() {
-  # $1: a JSON message object, as text
-  jq --argjson m "$1" '. + [$m]' /tmp/messages.json > /tmp/messages.json.tmp
+  # $1: a JSON message object, as text. Written to a file and read with
+  # --slurpfile rather than passed as --argjson — nothing caps how long an
+  # assistant turn's own content can run before it decides to call a tool
+  # (the benchmark that motivated this workflow saw one model emit ~1.85MB
+  # in a single turn), so the same argv-overflow risk applies here as
+  # everywhere else large content reaches jq in this script.
+  printf '%s' "$1" > /tmp/new_message.json
+  jq --slurpfile m /tmp/new_message.json '. + [$m[0]]' /tmp/messages.json > /tmp/messages.json.tmp
   mv /tmp/messages.json.tmp /tmp/messages.json
 }
 
@@ -127,6 +151,7 @@ append_message() {
 # unconstrained and a separate final call (phase 2) forces the schema once
 # the model is done looking things up.
 round=0
+stopped_naturally=""
 while [ "$round" -lt "$MAX_TOOL_ROUNDS" ]; do
   round=$((round + 1))
 
@@ -140,25 +165,34 @@ while [ "$round" -lt "$MAX_TOOL_ROUNDS" ]; do
     exit 1
   fi
 
+  # Append the assistant's turn unconditionally — including the plain-text
+  # turn that ends the loop below, so phase 2 shapes the analysis the model
+  # already reached instead of re-deriving the whole review from scratch.
+  append_message "$(jq -c '.choices[0].message' /tmp/response.json)"
+
   TOOL_CALLS=$(jq -c '.choices[0].message.tool_calls // []' /tmp/response.json 2>/dev/null) || TOOL_CALLS="[]"
   if [ "$TOOL_CALLS" = "[]" ] || [ "$TOOL_CALLS" = "null" ]; then
+    stopped_naturally=1
     break
   fi
 
-  append_message "$(jq -c '.choices[0].message' /tmp/response.json)"
   while IFS= read -r call; do
     [ -z "$call" ] && continue
-    call_id=$(jq -r '.id' <<<"$call")
+    call_id=$(jq -r '.id // "unknown"' <<<"$call")
     fn=$(jq -c '.function' <<<"$call")
     result=$(dispatch_tool_call "$fn")
     append_message "$(jq -n --arg id "$call_id" --arg content "$result" '{role:"tool", tool_call_id:$id, content:$content}')"
   done < <(jq -c '.[]' <<<"$TOOL_CALLS")
 done
 
-if [ "$round" -ge "$MAX_TOOL_ROUNDS" ]; then
-  append_message '{"role":"user","content":"You have reached the tool-call limit. Stop investigating and produce your final review now, from what you have already learned."}'
-else
+# `round == MAX_TOOL_ROUNDS` on its own can't tell a model that stopped on
+# its last permitted round from one that was cut off — stopped_naturally is
+# only set on the break above, so it's the one thing that actually
+# distinguishes the two.
+if [ -n "$stopped_naturally" ]; then
   append_message '{"role":"user","content":"You now have everything you asked for. Produce your final review now."}'
+else
+  append_message '{"role":"user","content":"You have reached the tool-call limit. Stop investigating and produce your final review now, from what you have already learned."}'
 fi
 
 # Phase 2: one final call, schema-constrained, no tools — whatever the model

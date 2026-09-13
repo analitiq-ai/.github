@@ -3,13 +3,30 @@
 # head commit — never a working-tree checkout, so a tool call can surface
 # file content without ever making PR-authored code executable.
 #
-# Sourced by review.sh (not run standalone — no `set -euo pipefail` here, so
-# a single malformed or failing tool call can't abort the review loop via
-# the caller's own -e). Requires PR_HEAD in the environment (the PR's head
-# SHA, already fetched as objects-only by the "Fetch PR head" step).
+# Sourced by review.sh, not run standalone. Requires PR_HEAD in the
+# environment (the PR's head SHA, already fetched as objects-only by the
+# "Fetch PR head" step).
+: "${PR_HEAD:?PR_HEAD is required}"
 
 TOOL_OUTPUT_CAP=8000   # bytes; keeps one tool result from dominating context
 LIST_OUTPUT_CAP=4000
+
+# Truncates $1 to at most $TOOL_OUTPUT_CAP/$LIST_OUTPUT_CAP bytes and prints
+# it, appending a marker if it actually cut something. Compares the
+# TRUNCATED output's own byte count against the cap, not the original's —
+# `${#raw}` counts characters, `head -c` counts bytes, and multi-byte UTF-8
+# content can be under the character cap while over the byte cap (or the
+# reverse), which either silently truncates with no marker or prints one
+# that never fires.
+_cap_output() {
+  local raw="$1" cap="$2" truncated tlen
+  truncated=$(printf '%s' "$raw" | head -c "$cap")
+  tlen=$(printf '%s' "$truncated" | wc -c)
+  printf '%s' "$truncated"
+  if [ "$tlen" -ge "$cap" ]; then
+    printf '\n[truncated at %d bytes]' "$cap"
+  fi
+}
 
 TOOLS_SCHEMA='[
   {"type":"function","function":{
@@ -42,7 +59,7 @@ _reject_traversal() {
 }
 
 tool_read_file() {
-  local path="$1" raw truncated
+  local path="$1" raw
   if ! _reject_traversal "$path"; then
     printf 'error: invalid path'
     return 0
@@ -51,11 +68,7 @@ tool_read_file() {
     printf 'error: no such file at the PR head: %s' "$path"
     return 0
   fi
-  truncated=$(printf '%s' "$raw" | head -c "$TOOL_OUTPUT_CAP")
-  printf '%s' "$truncated"
-  if [ "${#raw}" -gt "$TOOL_OUTPUT_CAP" ]; then
-    printf '\n[truncated at %d bytes]' "$TOOL_OUTPUT_CAP"
-  fi
+  _cap_output "$raw" "$TOOL_OUTPUT_CAP"
 }
 
 tool_grep() {
@@ -69,7 +82,11 @@ tool_grep() {
     printf 'no matches'
     return 0
   fi
-  printf '%s' "$result" | head -c "$TOOL_OUTPUT_CAP"
+  # Every line is prefixed with the full commit SHA (git grep <rev> behavior)
+  # — constant, uninformative to the model, and it eats into the same output
+  # cap real matches compete for.
+  result=$(printf '%s\n' "$result" | sed "s/^${PR_HEAD}://")
+  _cap_output "$result" "$TOOL_OUTPUT_CAP"
 }
 
 tool_list_files() {
@@ -79,10 +96,7 @@ tool_list_files() {
   else
     result=$(timeout 10 git ls-tree -r --name-only "$PR_HEAD" 2>&1) || true
   fi
-  printf '%s' "$result" | head -c "$LIST_OUTPUT_CAP"
-  if [ "${#result}" -gt "$LIST_OUTPUT_CAP" ]; then
-    printf '\n[truncated — narrow with a glob]'
-  fi
+  _cap_output "$result" "$LIST_OUTPUT_CAP"
 }
 
 # Dispatches one {"name":..., "arguments": "<json string>"} tool_call object
