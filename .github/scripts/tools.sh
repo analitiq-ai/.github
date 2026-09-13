@@ -12,18 +12,22 @@ TOOL_OUTPUT_CAP=8000   # bytes; keeps one tool result from dominating context
 LIST_OUTPUT_CAP=4000
 
 # Truncates $1 to at most $TOOL_OUTPUT_CAP/$LIST_OUTPUT_CAP bytes and prints
-# it, appending a marker if it actually cut something. The decision compares
-# the ORIGINAL content's byte length (measured by piping into wc -c, never
-# by capturing truncated output back into a variable) against the cap —
-# capturing via `$(...)` strips trailing newlines, so measuring the
-# already-truncated output undercounts whenever the cut lands on one, and
-# the marker silently fails to fire for exactly the content most likely to
-# end on a line break. Piping `head -c` straight to stdout, uncaptured,
-# sidesteps that entirely for the bytes actually emitted.
+# it, appending a marker if it actually cut something. Goes through a temp
+# file rather than a `printf | head -c` pipe on purpose: when raw is bigger
+# than cap, `head -c` reads its `cap` bytes and exits, and the still-writing
+# `printf` on the other end of the pipe gets SIGPIPE — seen for real on the
+# ubuntu-latest runner ("printf: write error: Broken pipe") on every actual
+# truncation. Reading cap bytes from a file has no producer to interrupt.
+# Measuring the ORIGINAL content's byte length (not the truncated output's)
+# matters too — capturing truncated output back through `$(...)` strips
+# trailing newlines, so measuring that instead would undercount whenever the
+# cut landed on one and silently miss the marker for exactly the content
+# most likely to end on a line break.
 _cap_output() {
   local raw="$1" cap="$2" rlen
-  rlen=$(printf '%s' "$raw" | wc -c)
-  printf '%s' "$raw" | head -c "$cap"
+  printf '%s' "$raw" > /tmp/_cap_output.tmp
+  rlen=$(wc -c < /tmp/_cap_output.tmp)
+  head -c "$cap" /tmp/_cap_output.tmp
   if [ "$rlen" -gt "$cap" ]; then
     printf '\n[truncated at %d bytes]' "$cap"
   fi

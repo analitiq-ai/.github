@@ -121,4 +121,4 @@ jobs:
         run: _reviewer/.github/scripts/review.sh "${{ steps.base.outputs.mode }}"
 
       - name: Post
-        run: _reviewer/.github/scripts/post.sh "${{ steps.fetch_pr.outputs.head }}"
+        run: _reviewer/.github/scripts/post.sh "${{ steps.fetch_pr.outputs.head }}" "${{ steps.base.outputs.mode }}"
