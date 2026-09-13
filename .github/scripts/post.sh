@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 HEAD_SHA="$1"
+MODE="${2:-full}"
 
 # lines actually present in the diff, as "path:line" (new-file/right-hand side).
 # `next` after the +++ rule matters: without it, a file-header line itself
@@ -28,9 +29,19 @@ echo "::notice::posting $KEPT/$TOTAL model-proposed inline comments (rest failed
 # prior round) gets a fixed message rather than the model's own freeform
 # summary — "reviewed this diff, no bugs" reads differently every time
 # depending on wording the model chose, for a case with only one real
-# outcome to report.
+# outcome to report. But "clean" isn't the same claim as "complete": say so
+# when build-diff.sh dropped files for size, or this was only an
+# incremental pass — otherwise the fixed wording overclaims coverage the
+# model's own summary would have caveated.
 if [ "$TOTAL" -eq 0 ] && [ "$(jq '(.prior_findings // []) | length' /tmp/out.json)" -eq 0 ]; then
   SUMMARY="Reviewed — no issues found."
+  if [ "$MODE" = "incremental" ]; then
+    SUMMARY="$SUMMARY (incremental — only the changes since the last review)"
+  fi
+  if grep -q '^SKIPPED_FILES:' /tmp/diff.txt; then
+    SKIPPED=$(grep '^SKIPPED_FILES:' /tmp/diff.txt | sed 's/^SKIPPED_FILES://')
+    SUMMARY="$SUMMARY Some files were too large to include in this review:$SKIPPED."
+  fi
 else
   SUMMARY=$(jq -r '.summary' /tmp/out.json)
 fi
