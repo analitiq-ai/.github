@@ -1,0 +1,73 @@
+name: PR Gate (reusable)
+
+# Posts the `codex-review` and `internal-review` commit statuses on a PR's head
+# so a ruleset can require them. The rules live in .github/scripts/pr-gate.js;
+# what a caller may and may not do is in the README's `pr-gate.yml` section.
+#
+# pull_request_target (not pull_request) because posting a status needs a write
+# token even for fork PRs. It is safe here because nothing from the PR is ever
+# checked out or executed: the only checkout is this repo's scripts, and the
+# job reads PR metadata through the API.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  statuses: write
+  checks: read
+  pull-requests: read
+  issues: read
+
+jobs:
+  # The commit statuses must be the only reporters of `codex-review` and
+  # `internal-review`: a required context is satisfied by any check run or
+  # status with that exact name, and this job succeeds whenever the script
+  # runs, not when the gate passes. It reports as `<caller job> / evaluate`,
+  # which cannot collide.
+  evaluate:
+    runs-on: ubuntu-latest
+    # One evaluation per PR at a time: statuses are last-writer-wins, so an
+    # older run finishing late would overwrite a newer verdict. The sweep runs
+    # in its own group, which is why pr-gate.js re-reads before demoting.
+    concurrency:
+      group: pr-gate-${{ github.event.pull_request.number || github.event.issue.number || 'sweep' }}
+    steps:
+      # Re-asserted here so the rule has one definition instead of living only
+      # as a convention copied into every consumer. A review event executes the
+      # caller from the PR merge ref, and a manual dispatch from whichever ref
+      # is selected, so a same-repo PR that edits the caller would run its own
+      # version with the caller's write token. Refusing here cannot prevent
+      # that; it makes a consumer who wires such a trigger by mistake fail on
+      # the first run.
+      - name: Refuse triggers that do not run the caller from the default branch
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          case "$EVENT" in
+            pull_request_target|issue_comment|schedule) ;;
+            *) echo "::error::pr-gate must not be triggered by '$EVENT'"; exit 1 ;;
+          esac
+
+      # The default checkout target inside a called workflow is the CALLING
+      # repo, so the script must be fetched from here explicitly. `ref: main`
+      # so a rule change reaches every consumer without each bumping a pin; a
+      # caller pinning this workflow to a SHA still runs main's script.
+      - name: Checkout gate script (never the caller's tree)
+        uses: actions/checkout@v5
+        with:
+          repository: analitiq-ai/.github
+          ref: main
+          path: _gate
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Evaluate
+        uses: actions/github-script@v8
+        with:
+          # A single 5xx from the API would otherwise turn two valid successes
+          # into `error` until the next run.
+          retries: 3
+          script: |
+            const gate = require(`${process.env.GITHUB_WORKSPACE}/_gate/.github/scripts/pr-gate.js`);
+            await gate.run({ github, context, core });
