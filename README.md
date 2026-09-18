@@ -10,6 +10,10 @@ from a thin caller workflow in each consuming repo, rather than copy-pasted.
 
 - `.github/workflows/ai-review.yml` — reusable workflow: an AI-generated code
   review posted as inline PR comments, triggered by a `/review` comment.
+- `.github/workflows/pr-gate.yml` — reusable workflow: posts the
+  `codex-review` and `internal-review` commit statuses on a PR's head, so a
+  ruleset can require them. Rules in `.github/scripts/pr-gate.js`, tests in
+  `tests/` (`node --test`).
 
 ## `ai-review.yml`
 
@@ -139,3 +143,137 @@ the structured verdict.
   problem.
 - Pilot on a repo's historical PRs and count false positives before trusting
   it on live work.
+
+
+## `pr-gate.yml`
+
+Posts two commit statuses on the head of every open PR. Both are bound to the
+commit they name, so a push voids them without anyone revoking anything.
+
+| Status | `success` when | Otherwise |
+|---|---|---|
+| `codex-review` | Codex's newest verdict naming the head commit is its clean template ("Codex Review: Didn't find any major issues") with no findings preamble — or no verdict names the head and the [credit waiver](#the-codex-credit-waiver) applies | `pending` |
+| `internal-review` | a comment from `Analitiq-Bot` carries the attestation marker and names the head commit | `pending` |
+
+A crash in the gate posts `error` on both, which still blocks a merge.
+
+### The internal-review attestation
+
+Posted by the agent once the internal review pass comes back clean on the
+exact commit being merged:
+
+```
+<!-- analitiq-internal-review -->
+Internal review clean.
+Reviewed commit: `<full head sha>`
+```
+
+The gate can verify who posted it and which commit it names — not that the
+review happened. It is a reminder with a SHA on it, not proof.
+
+### The Codex credit waiver
+
+When the account is out of review credits, Codex answers a review request with
+"Codex usage limits have been reached for code reviews…" instead of a review.
+Rather than block every PR until credits return, that answer waives the
+requirement:
+
+- only when **no** verdict names the head — a verdict for the head, clean or
+  not, always outranks a waiver;
+- only when the **whole comment** is exactly that message. The comment names
+  no commit, so anything looser would let anyone who can get Codex to echo the
+  sentence, or open a reply with it, waive the review;
+- only when the comment was created **after the head commit was pushed**. An
+  older answer says nothing about this commit: credits may have returned in
+  between, and then Codex owes it a real review. Creation time, not edit time,
+  so an edit cannot refresh an old comment.
+
+The push is dated by the commit's earliest check suite, which GitHub opens for
+each installed app the moment a commit arrives. It is server-side (commit dates
+are set by the author) and any run can read it, so the outcome does not depend
+on which run got to the head first, or on one having crashed. A head with no
+check suite is never waived.
+
+If the head was pushed after Codex's last out-of-credits answer and credits are
+still out, comment `@codex review`: Codex repeats the answer, now dated after
+the push.
+
+The status reads `WAIVED: Codex is out of credits; <sha> was not reviewed`, so
+a skipped review is never mistaken for a passed one.
+
+If Codex says nothing at all, nothing is waived.
+
+### What is deliberately not honored
+
+- **A 👍 reaction.** It names no commit, so tying it to a head needs timestamp
+  heuristics that are either forgeable or wedge valid approvals. When Codex
+  answers with a bare 👍, re-request the review so it posts a verdict comment.
+- **A commit prefix under 10 hex digits**, in either status. Ten is what Codex
+  emits; accepting fewer would make it cheaper to craft a commit whose SHA
+  collides with a stale verdict's prefix after a force-push.
+
+### Wiring it into a consumer repo
+
+```yaml
+name: pr-gate
+
+# Only events that run this file from the default branch. Never add
+# pull_request_review or workflow_dispatch: a review event executes the
+# workflow file from the PR merge ref, and a manual dispatch runs whichever ref
+# is selected, so either lets a PR that edits this file post its own success.
+# The reusable workflow refuses any other event. Verdicts delivered as PR
+# reviews are picked up by the sweep.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  issue_comment:
+    types: [created, edited, deleted]
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: read
+  statuses: write
+  checks: read
+  pull-requests: read
+  issues: read
+
+jobs:
+  gate:
+    # Comment events fire for every author; only these two can change a status.
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request &&
+       (github.event.comment.user.login == 'chatgpt-codex-connector[bot]' ||
+        github.event.comment.user.login == 'Analitiq-Bot'))
+    uses: analitiq-ai/.github/.github/workflows/pr-gate.yml@main
+```
+
+The `if:` is a cost gate, not a security boundary: a run only re-reads the PR
+and re-derives both statuses, whoever triggered it.
+
+Then require `codex-review` and `internal-review` in the branch ruleset.
+
+The gate script is always fetched from this repo's `main`, whatever ref the
+caller's `uses:` names, so a rule change reaches every consumer without each
+bumping a pin. Pinning `uses:` to a SHA pins the workflow file, not the rules.
+
+### Limits
+
+- **A commit status is not proof of origin.** Anyone who can push a branch to
+  the consuming repo can add a workflow of their own that posts `codex-review`
+  with a write token. The gate stops mistakes and stale verdicts, not a
+  collaborator acting in bad faith; forks cannot do this.
+- **The waiver trusts the shape of Codex's message.** A reply in which Codex is
+  talked into reproducing the entire usage-limit message, and nothing else,
+  would waive the review. If Codex rewords the message, nothing is waived
+  until the gate is updated.
+- **A push is dated by when the commit first reached GitHub**, which is earlier
+  than when it became this PR's head if it sat on another branch first. An
+  out-of-credits answer from that interval then counts for it.
+- **Statuses belong to a commit, not a PR.** Two open PRs sharing a head SHA
+  overwrite each other's statuses.
+- **A stale `success` is revoked by the next event or sweep, not instantly.**
+  A deleted attestation or dismissed review takes effect then. The sweep runs
+  outside the per-PR concurrency group and statuses are last-writer-wins; the
+  gate re-reads before demoting, which narrows that race without closing it.
