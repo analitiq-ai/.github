@@ -111,7 +111,7 @@ function headArrivedAt({ events, head, headPushedAt }) {
 // Returns that verdict, or why there is none; null when Codex shows neither.
 function codexReactionAnswer({ responses, reactions, events, openedAt, draft, head, headPushedAt }) {
   if (codexReactions(reactions, REVIEWING).length > 0) {
-    return { pending: `Codex is reviewing; waiting for its verdict on ${short(head)}` };
+    return { pending: `Codex is reviewing; waiting for its verdict on ${short(head)}`, reviewing: true };
   }
   // GitHub keeps one reaction per user and content.
   const [thumbsUp] = codexReactions(reactions, THUMBS_UP);
@@ -136,11 +136,23 @@ function codexReactionAnswer({ responses, reactions, events, openedAt, draft, he
     : { pending: `Codex's 👍 is not tied to ${short(head)}; comment @codex review` };
 }
 
+// Codex's out-of-credits answer names no commit, so its age against the push
+// is the only thing tying it to this head: an answer older than the push says
+// nothing about whether credits have returned since. Returns whether it waives
+// the head, or why not; null when Codex never gave it.
+function outOfCreditsAnswer({ codexComments, head, headPushedAt }) {
+  const answers = codexComments.filter((c) => (c.body || '').trim() === USAGE_LIMIT_MESSAGE);
+  if (answers.length === 0) return null;
+  if (headPushedAt === null) {
+    return { pending: `Codex is out of credits; ${short(head)} has no check suite to date its push, so it is not waived` };
+  }
+  // Dated by creation: an edit must not be able to make an old answer recent.
+  if (answers.some((c) => timestamp(c.created_at, 'Codex comment') > headPushedAt)) return { waives: true };
+  return { pending: `Codex's out-of-credits answer predates ${short(head)}; comment @codex review` };
+}
+
 // headPushedAt: when the head commit reached GitHub, in epoch milliseconds, or
-//   null when that is unknown. Codex's out-of-credits answer names no commit,
-//   so its age against the push is the only thing tying it to this head: an
-//   answer older than the push says nothing about whether credits have
-//   returned since.
+//   null when that is unknown.
 // reactions: those on the PR description. events: the PR's issue events.
 // openedAt: when the PR was opened. draft: whether it is a draft now.
 function codexStatus({ comments, reviews, reactions, events, openedAt, draft, head, headPushedAt }) {
@@ -190,38 +202,27 @@ function codexStatus({ comments, reviews, reactions, events, openedAt, draft, he
     };
   }
 
-  // The waiver only fills the absence of a verdict; it never outranks one.
-  const outOfCredits = codexComments.filter((c) => (c.body || '').trim() === USAGE_LIMIT_MESSAGE);
-  if (outOfCredits.length === 0) {
-    const description =
-      reactionAnswer?.pending ??
-      (responses.length > 0
-        ? `No clean Codex verdict for ${short(head)} yet`
-        : `Waiting for a Codex review of ${short(head)}`);
-    return responses.length > 0
-      ? {
-          state: 'pending',
-          description,
-          // If Codex rewords its template, this is the only trace that it
-          // answered at all.
-          notice: `Codex responded, but no verdict names ${short(head)}`,
-        }
-      : { state: 'pending', description };
-  }
-  if (headPushedAt === null) {
-    return {
-      state: 'pending',
-      description: `Codex is out of credits; ${short(head)} has no check suite to date its push, so it is not waived`,
-    };
-  }
-  // Dated by creation: an edit must not be able to make an old answer recent.
-  if (outOfCredits.some((c) => timestamp(c.created_at, 'Codex comment') > headPushedAt)) {
+  // The waiver only fills the absence of a verdict, and only while Codex runs
+  // no review: one running shows the credits are back.
+  const credits = outOfCreditsAnswer({ codexComments, head, headPushedAt });
+  if (credits?.waives && !reactionAnswer?.reviewing) {
     return { state: 'success', description: `WAIVED: Codex is out of credits; ${short(head)} was not reviewed` };
   }
-  return {
-    state: 'pending',
-    description: `Codex's out-of-credits answer predates ${short(head)}; comment @codex review`,
-  };
+  const description =
+    reactionAnswer?.pending ??
+    credits?.pending ??
+    (responses.length > 0
+      ? `No clean Codex verdict for ${short(head)} yet`
+      : `Waiting for a Codex review of ${short(head)}`);
+  return responses.length > 0
+    ? {
+        state: 'pending',
+        description,
+        // If Codex rewords its template, this is the only trace that it
+        // answered at all.
+        notice: `Codex responded, but no verdict names ${short(head)}`,
+      }
+    : { state: 'pending', description };
 }
 
 function internalReviewStatus({ comments, head }) {

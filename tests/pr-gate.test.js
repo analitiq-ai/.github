@@ -266,6 +266,7 @@ const NOT_TIED = `Codex's 👍 is not tied to ${HEAD10}; comment @codex review`;
 const TIED = `Codex found no major issues in ${HEAD10} (👍 on the PR)`;
 const REVIEWING = `Codex is reviewing; waiting for its verdict on ${HEAD10}`;
 const RESPONDED = `Codex responded, but no verdict names ${HEAD10}`;
+const UNDATED = `Codex's 👍 is not counted: ${HEAD10} has no check suite to date its push`;
 // After the PR's first ready request at BEFORE, before the head's push at T0.
 const EARLIER = '2025-12-31T23:30:00Z';
 
@@ -379,6 +380,15 @@ test('thumbs: a later ready request ties the 👍 again after a verdict on anoth
   assert.equal(s.description, TIED);
 });
 
+test('thumbs: converting the PR to draft is not a request that ties the 👍 again', () => {
+  const s = codex({
+    comments: [comment(CODEX, CLEAN(OTHER), T2)],
+    events: [READY(T1), DRAFTED(T3)],
+    reactions: [THUMBS_UP(T4)],
+  });
+  assert.equal(s.description, NOT_TIED);
+});
+
 test('thumbs: a verdict on another commit from before the request does not void it', () => {
   const s = codex({ comments: [comment(CODEX, FINDINGS(OTHER), BEFORE)], events: [READY(T1)], reactions: [THUMBS_UP(T2)] });
   assert.equal(s.state, 'success');
@@ -395,7 +405,7 @@ test('thumbs: while Codex shows 👀 on the description nothing counts, and the 
 test('thumbs: a push that cannot be dated ties no 👍, and the status says why', () => {
   const s = codex({ events: [READY(T1)], reactions: [THUMBS_UP(T2)], headPushedAt: null });
   assert.equal(s.state, 'pending');
-  assert.equal(s.description, `Codex's 👍 is not counted: ${HEAD10} has no check suite to date its push`);
+  assert.equal(s.description, UNDATED);
 });
 
 test('thumbs: whatever the 👍 says, the notice that Codex responded without naming the head stays', () => {
@@ -442,6 +452,33 @@ test('thumbs: an event or reaction without a parseable timestamp is an error, ne
   ]) {
     assert.throws(() => codex(given), /no valid timestamp/, JSON.stringify(given));
   }
+});
+
+// ------------------------------------------- codex-review: no verdict on the head
+
+test('status: while Codex shows 👀, no out-of-credits answer waives the head or asks for a review', () => {
+  // A running review shows the credits are back, and its verdict is minutes away.
+  for (const [limitAt, headPushedAt] of [[T1, Date.parse(T0)], [BEFORE, Date.parse(T0)], [T1, null]]) {
+    const s = codex({ comments: [comment(CODEX, LIMIT, limitAt)], reactions: [EYES(T2)], headPushedAt });
+    assert.equal(s.state, 'pending', `${limitAt} ${headPushedAt}`);
+    assert.equal(s.description, REVIEWING);
+  }
+});
+
+test('status: a 👍 that does not count says why ahead of an out-of-credits answer that does not waive', () => {
+  const stale = codex({ comments: [comment(CODEX, LIMIT, BEFORE)], reactions: [THUMBS_UP(T2)] });
+  assert.equal(stale.description, NOT_TIED);
+  const undated = codex({ comments: [comment(CODEX, LIMIT, T1)], reactions: [THUMBS_UP(T2)], headPushedAt: null });
+  assert.equal(undated.description, UNDATED);
+});
+
+test('status: an out-of-credits answer that does not waive still raises the notice that Codex responded', () => {
+  for (const [limitAt, headPushedAt] of [[BEFORE, Date.parse(T0)], [T1, null]]) {
+    const s = codex({ comments: [comment(CODEX, LIMIT, limitAt)], headPushedAt });
+    assert.equal(s.state, 'pending');
+    assert.equal(s.notice, RESPONDED, `${limitAt} ${headPushedAt}`);
+  }
+  assert.equal(codex({ comments: [comment(CODEX, LIMIT, T1)] }).notice, undefined);
 });
 
 // -------------------------------------------------------------- internal-review

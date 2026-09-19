@@ -186,7 +186,10 @@ requirement:
 - only when the comment was created **after the head commit was pushed**. An
   older answer says nothing about this commit: credits may have returned in
   between, and then Codex owes it a real review. Creation time, not edit time,
-  so an edit cannot refresh an old comment.
+  so an edit cannot refresh an old comment;
+- only while Codex shows **no 👀** on the PR description. A review running
+  shows its credits are back, and its verdict is minutes away. A 👍 does not
+  suspend the waiver.
 
 The push is dated by the commit's earliest check suite, which GitHub opens for
 each installed app the moment a commit arrives. It is server-side (commit dates
@@ -230,24 +233,34 @@ ready, only `@codex review` gets a verdict: Codex answers it with one naming
 the commit.
 
 A counted 👍 reads `Codex found no major issues in <sha> (👍 on the PR)`, so it
-is never mistaken for a verdict naming the commit. When no verdict names the
-head and Codex is not out of credits, the status says what the description
-shows:
-
-| Description | When |
-|---|---|
-| `Codex is reviewing; waiting for its verdict on <sha>` | Codex shows 👀 |
-| `Codex's 👍 is not counted: <sha> has no check suite to date its push` | a 👍, but the push cannot be dated |
-| `Codex's 👍 is not tied to <sha>; comment @codex review` | any other 👍 |
+is never mistaken for a verdict naming the commit.
 
 A reaction triggers no workflow, so nothing re-runs the gate when the 👍
 arrives; the next event or scheduled sweep would. To have it counted now, send
-the consuming repo a `repository_dispatch` of type `pr-gate`, which sweeps every
-open PR:
+the consuming repo a `repository_dispatch`, which sweeps every open PR. Callers
+do not filter on its event type, so no type has to be kept in step across
+repos:
 
 ```bash
 gh api repos/<owner>/<repo>/dispatches -f event_type=pr-gate
 ```
+
+### While no verdict names the head
+
+Unless the waiver applies, `codex-review` is pending, with the first
+description that applies:
+
+| When | Description |
+|---|---|
+| Codex shows 👀 | `Codex is reviewing; waiting for its verdict on <sha>` |
+| a Codex 👍, but the push cannot be dated | `Codex's 👍 is not counted: <sha> has no check suite to date its push` |
+| any other Codex 👍 | `Codex's 👍 is not tied to <sha>; comment @codex review` |
+| an out-of-credits answer, but the push cannot be dated | `Codex is out of credits; <sha> has no check suite to date its push, so it is not waived` |
+| an out-of-credits answer older than the push | `Codex's out-of-credits answer predates <sha>; comment @codex review` |
+| any other answer from Codex | `No clean Codex verdict for <sha> yet` |
+| no answer from Codex | `Waiting for a Codex review of <sha>` |
+
+Whenever Codex answered, the run log also notes that no verdict names the head.
 
 ### What is deliberately not honored
 
@@ -270,15 +283,14 @@ name: pr-gate
 # workflow file from the PR merge ref, and a manual dispatch runs whichever ref
 # is selected, so either lets a PR that edits this file post its own success.
 # The reusable workflow refuses any other event. Verdicts delivered as PR
-# reviews are picked up by the sweep, which a repository_dispatch of type
-# pr-gate runs on demand, e.g. once Codex gives its 👍.
+# reviews are picked up by the sweep, which a repository_dispatch runs on
+# demand, e.g. once Codex gives its 👍.
 on:
   pull_request_target:
     types: [opened, reopened, synchronize, ready_for_review]
   issue_comment:
     types: [created, edited, deleted]
   repository_dispatch:
-    types: [pr-gate]
   schedule:
     - cron: "*/15 * * * *"
 
@@ -329,6 +341,9 @@ bumping a pin. Pinning `uses:` to a SHA pins the workflow file, not the rules.
   marked ready, and Codex answers it with only a 👍 on the description, that
   👍 counts for the head. Codex normally answers that request with a verdict
   comment naming the commit, which voids the tie.
+- **A 👀 Codex leaves behind holds `codex-review` pending**, waiver included.
+  Codex has cleared its 👀 whenever a review ended so far, out of credits or
+  not.
 - **Statuses belong to a commit, not a PR.** Two open PRs sharing a head SHA
   overwrite each other's statuses.
 - **A stale `success` is revoked by the next event or sweep, not instantly.**
