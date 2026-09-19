@@ -202,8 +202,9 @@ function codexStatus({ comments, reviews, reactions, events, openedAt, draft, he
     };
   }
 
-  // The waiver only fills the absence of a verdict, and only while Codex runs
-  // no review: one running shows the credits are back.
+  // The waiver only fills the absence of a verdict, and never while Codex shows
+  // 👀: a review is running, and its answer, a verdict or a fresh
+  // out-of-credits reply, is minutes away.
   const credits = outOfCreditsAnswer({ codexComments, head, headPushedAt });
   if (credits?.waives && !reactionAnswer?.reviewing) {
     return { state: 'success', description: `WAIVED: Codex is out of credits; ${short(head)} was not reviewed` };

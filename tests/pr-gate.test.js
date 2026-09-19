@@ -457,7 +457,8 @@ test('thumbs: an event or reaction without a parseable timestamp is an error, ne
 // ------------------------------------------- codex-review: no verdict on the head
 
 test('status: while Codex shows 👀, no out-of-credits answer waives the head or asks for a review', () => {
-  // A running review shows the credits are back, and its verdict is minutes away.
+  // A review is running: its answer, a verdict or a fresh out-of-credits reply,
+  // is minutes away.
   for (const [limitAt, headPushedAt] of [[T1, Date.parse(T0)], [BEFORE, Date.parse(T0)], [T1, null]]) {
     const s = codex({ comments: [comment(CODEX, LIMIT, limitAt)], reactions: [EYES(T2)], headPushedAt });
     assert.equal(s.state, 'pending', `${limitAt} ${headPushedAt}`);

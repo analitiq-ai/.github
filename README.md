@@ -187,9 +187,10 @@ requirement:
   older answer says nothing about this commit: credits may have returned in
   between, and then Codex owes it a real review. Creation time, not edit time,
   so an edit cannot refresh an old comment;
-- only while Codex shows **no 👀** on the PR description. A review running
-  shows its credits are back, and its verdict is minutes away. A 👍 does not
-  suspend the waiver.
+- only while Codex shows **no 👀** on the PR description: a review is
+  running, and its answer, a verdict or a fresh out-of-credits reply, is
+  minutes away. A 👍 marks a review that has ended, so it does not suspend
+  the waiver.
 
 The push is dated by the commit's earliest check suite, which GitHub opens for
 each installed app the moment a commit arrives. It is server-side (commit dates
@@ -342,8 +343,8 @@ bumping a pin. Pinning `uses:` to a SHA pins the workflow file, not the rules.
   👍 counts for the head. Codex normally answers that request with a verdict
   comment naming the commit, which voids the tie.
 - **A 👀 Codex leaves behind holds `codex-review` pending**, waiver included.
-  Codex has cleared its 👀 whenever a review ended so far, out of credits or
-  not.
+  None has been seen left behind, including on PRs whose last Codex answer
+  was out of credits.
 - **Statuses belong to a commit, not a PR.** Two open PRs sharing a head SHA
   overwrite each other's statuses.
 - **A stale `success` is revoked by the next event or sweep, not instantly.**
