@@ -152,7 +152,7 @@ commit they name, so a push voids them without anyone revoking anything.
 
 | Status | `success` when | Otherwise |
 |---|---|---|
-| `codex-review` | Codex's newest verdict naming the head commit is its clean template ("Codex Review: Didn't find any major issues") with no findings preamble — or no verdict names the head and the [credit waiver](#the-codex-credit-waiver) applies | `pending` |
+| `codex-review` | Codex's newest verdict on the head commit is clean: its clean template ("Codex Review: Didn't find any major issues") with no findings preamble, or a [👍 tied to the head](#the-codex-thumbs-up) — or no verdict is on the head and the [credit waiver](#the-codex-credit-waiver) applies | `pending` |
 | `internal-review` | a comment from `Analitiq-Bot` carries the attestation marker and names the head commit | `pending` |
 
 A crash in the gate posts `error` on both, which still blocks a merge.
@@ -203,11 +203,41 @@ a skipped review is never mistaken for a passed one.
 
 If Codex says nothing at all, nothing is waived.
 
+### The Codex thumbs-up
+
+Codex also reviews a PR unasked: when it is opened, and each time it is marked
+ready for review. A clean review of that kind gets no comment, only a 👍 on the
+PR description, which Codex swaps for 👀 while a review runs. The 👍 names no
+commit, so it counts as a clean verdict, ranked at the time it was given, only
+when the request it answers was provably for the head:
+
+- the PR was opened or marked ready **after the head was pushed** (dated as for
+  the waiver), and the 👍 came after that;
+- **no force-push** came after that request: one could have swapped the
+  reviewed commit out and the head back in;
+- **no Codex verdict naming another commit** came after that request: that is a
+  review of an older commit still finishing, and its 👍 looks the same;
+- Codex shows **no 👀** on the description, so no review is still running.
+
+A 👍 that does not qualify leaves the status at `Codex's 👍 is not tied to
+<sha>; comment @codex review`. Codex answers that comment with a verdict naming
+the commit.
+
+A reaction triggers no workflow, so nothing re-runs the gate when the 👍
+arrives; the next event or scheduled sweep would. To have it counted now, send
+the consuming repo a `repository_dispatch` of type `pr-gate`, which sweeps every
+open PR:
+
+```bash
+gh api repos/<owner>/<repo>/dispatches -f event_type=pr-gate
+```
+
 ### What is deliberately not honored
 
-- **A 👍 reaction.** It names no commit, so tying it to a head needs timestamp
-  heuristics that are either forgeable or wedge valid approvals. When Codex
-  answers with a bare 👍, re-request the review so it posts a verdict comment.
+- **A 👍 whose only request since the push is the push itself, or an
+  `@codex review` comment.** Codex reviews some pushes unasked but not all, so
+  a 👍 after one can be an older review finishing. Codex answers
+  `@codex review` with a verdict naming the commit, which counts on its own.
 - **A commit prefix under 10 hex digits**, in either status. Ten is what Codex
   emits; accepting fewer would make it cheaper to craft a commit whose SHA
   collides with a stale verdict's prefix after a force-push.
@@ -222,12 +252,15 @@ name: pr-gate
 # workflow file from the PR merge ref, and a manual dispatch runs whichever ref
 # is selected, so either lets a PR that edits this file post its own success.
 # The reusable workflow refuses any other event. Verdicts delivered as PR
-# reviews are picked up by the sweep.
+# reviews are picked up by the sweep, which a repository_dispatch of type
+# pr-gate runs on demand, e.g. once Codex gives its 👍.
 on:
   pull_request_target:
     types: [opened, reopened, synchronize, ready_for_review]
   issue_comment:
     types: [created, edited, deleted]
+  repository_dispatch:
+    types: [pr-gate]
   schedule:
     - cron: "*/15 * * * *"
 
@@ -270,10 +303,17 @@ bumping a pin. Pinning `uses:` to a SHA pins the workflow file, not the rules.
   until the gate is updated.
 - **A push is dated by when the commit first reached GitHub**, which is earlier
   than when it became this PR's head if it sat on another branch first. An
-  out-of-credits answer from that interval then counts for it.
+  out-of-credits answer from that interval then counts for it, and so does a
+  👍 answering a request from that interval, unless the head arrived by
+  force-push.
+- **Two of Codex's own reviews can overlap.** If a PR is converted to draft,
+  pushed and marked ready again while Codex is still reviewing an older commit,
+  that review's 👍 can land after the new request and count for the new head.
+  The new review's verdict supersedes it once the gate runs again.
 - **Statuses belong to a commit, not a PR.** Two open PRs sharing a head SHA
   overwrite each other's statuses.
 - **A stale `success` is revoked by the next event or sweep, not instantly.**
-  A deleted attestation or dismissed review takes effect then. The sweep runs
-  outside the per-PR concurrency group and statuses are last-writer-wins; the
-  gate re-reads before demoting, which narrows that race without closing it.
+  A deleted attestation, a dismissed review or a withdrawn 👍 takes effect
+  then. The sweep runs outside the per-PR concurrency group and statuses are
+  last-writer-wins; the gate re-reads before demoting, which narrows that race
+  without closing it.

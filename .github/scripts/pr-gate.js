@@ -11,12 +11,13 @@
 // verdict for the old head must stop counting without anyone remembering to
 // revoke it.
 //
-// Reactions are deliberately not honored as verdicts. A +1 names no commit, so
-// tying it to a head needs timestamp heuristics that are either forgeable or
-// wedge valid approvals.
+// Codex's 👍 names no commit, so it counts only when the request it answers
+// ties it to the head (see thumbsUpVerdicts).
 
 const CODEX = 'chatgpt-codex-connector[bot]';
 const CODEX_CONTEXT = 'codex-review';
+const THUMBS_UP = '+1';
+const REVIEWING = 'eyes';
 
 // Line-anchored to Codex's clean-verdict template. The findings preamble
 // rejects a body outright, because a findings review can legitimately open a
@@ -66,11 +67,46 @@ function timestamp(value, what) {
 const namesHead = (body, pattern, head) =>
   [...body.matchAll(pattern)].some((match) => head.startsWith(match[1].toLowerCase()));
 
+const codexReactions = (reactions, content) => reactions.filter((r) => authoredBy(r, CODEX) && r.content === content);
+
+// Codex also reviews a PR unasked when it is opened and each time it is marked
+// ready, and answers a clean review of that kind with nothing but a 👍 on the
+// description. Which commit that review read is recorded nowhere, so the 👍
+// counts, as a clean verdict at its own time, only after such a request that
+// provably came for the head:
+//   - made after the head was pushed, with no force-push since, which could
+//     have swapped the reviewed commit out and the head back in;
+//   - with no Codex verdict on another commit since: that is an older review
+//     still finishing, and its 👍 looks the same.
+// Nor while Codex shows 👀 there, its sign that a review is still running.
+// `@codex review` comments are not such requests: Codex answers them with a
+// verdict naming the commit, which counts on its own. Nor are pushes: Codex
+// reviews some pushes unasked but not all, so a 👍 after one can be an older
+// review finishing.
+function thumbsUpVerdicts({ responses, reactions, events, openedAt, head, headPushedAt }) {
+  const given = codexReactions(reactions, THUMBS_UP).map((r) => timestamp(r.created_at, 'Codex reaction'));
+  if (given.length === 0 || headPushedAt === null || codexReactions(reactions, REVIEWING).length > 0) return [];
+
+  const dated = (name) => events.filter((e) => e.event === name).map((e) => timestamp(e.created_at, `${name} event`));
+  const voiding = dated('head_ref_force_pushed').concat(
+    responses
+      .filter((r) => r.body.search(CODEX_REVIEWED_COMMIT) !== -1 && !namesHead(r.body, CODEX_REVIEWED_COMMIT, head))
+      .map((r) => r.created),
+  );
+  // A tie is ordered against the request, never for it.
+  const requests = [timestamp(openedAt, 'pull request'), ...dated('ready_for_review')].filter(
+    (requested) => requested > headPushedAt && !voiding.some((at) => at >= requested),
+  );
+  return given.filter((at) => requests.some((requested) => requested < at)).map((at) => ({ clean: true, at }));
+}
+
 // headPushedAt: when the head commit reached GitHub, in epoch milliseconds,
 //   or null when that is unknown. Codex's out-of-credits answer names no commit, so its age against
 //   the push is the only thing tying it to this head: an answer older than the
 //   push says nothing about whether credits have returned since.
-function codexStatus({ comments, reviews, head, headPushedAt }) {
+// reactions: those on the PR description. events: the PR's issue events.
+// openedAt: when the PR was opened.
+function codexStatus({ comments, reviews, reactions, events, openedAt, head, headPushedAt }) {
   const codexComments = comments.filter((c) => authoredBy(c, CODEX));
 
   const responses = codexComments
@@ -90,15 +126,16 @@ function codexStatus({ comments, reviews, head, headPushedAt }) {
         }),
     );
 
-  // The newest verdict naming this exact commit decides. A clean verdict ranks
-  // at its creation and a findings verdict at its last edit, so an edit can
-  // void an approval but can never revive one that a later review overruled.
+  // The newest verdict on this exact commit decides. A clean verdict ranks at
+  // its creation and a findings verdict at its last edit, so an edit can void
+  // an approval but can never revive one that a later review overruled.
   const verdicts = responses
     .filter((r) => namesHead(r.body, CODEX_REVIEWED_COMMIT, head))
     .map((r) => {
       const clean = CLEAN.test(r.body) && !FINDINGS.test(r.body);
       return { clean, at: clean ? r.created : Math.max(r.created, r.edited) };
     })
+    .concat(thumbsUpVerdicts({ responses, reactions, events, openedAt, head, headPushedAt }))
     // At the same instant the non-clean verdict sorts last, and so decides.
     .sort((a, b) => a.at - b.at || Number(b.clean) - Number(a.clean));
   const latest = verdicts[verdicts.length - 1];
@@ -116,6 +153,9 @@ function codexStatus({ comments, reviews, head, headPushedAt }) {
   // The waiver only fills the absence of a verdict; it never outranks one.
   const outOfCredits = codexComments.filter((c) => (c.body || '').trim() === USAGE_LIMIT_MESSAGE);
   if (outOfCredits.length === 0) {
+    if (codexReactions(reactions, THUMBS_UP).length > 0) {
+      return { state: 'pending', description: `Codex's 👍 is not tied to ${short(head)}; comment @codex review` };
+    }
     return responses.length > 0
       ? {
           state: 'pending',
@@ -198,6 +238,18 @@ async function readStatuses({ github, owner, repo, pr }) {
     pull_number: pr.number,
     per_page: 100,
   });
+  const reactions = await github.paginate(github.rest.reactions.listForIssue, {
+    owner,
+    repo,
+    issue_number: pr.number,
+    per_page: 100,
+  });
+  const events = await github.paginate(github.rest.issues.listEvents, {
+    owner,
+    repo,
+    issue_number: pr.number,
+    per_page: 100,
+  });
 
   // GitHub opens a check suite per installed app the moment a commit is
   // pushed. It is the one server-side record of that moment every run can
@@ -213,7 +265,7 @@ async function readStatuses({ github, owner, repo, pr }) {
   const headPushedAt = pushTimes.length > 0 ? Math.min(...pushTimes) : null;
 
   return {
-    [CODEX_CONTEXT]: codexStatus({ comments, reviews, head, headPushedAt }),
+    [CODEX_CONTEXT]: codexStatus({ comments, reviews, reactions, events, openedAt: pr.created_at, head, headPushedAt }),
     [INTERNAL_CONTEXT]: internalReviewStatus({ comments, head }),
   };
 }
@@ -277,7 +329,9 @@ async function evaluate({ github, core, owner, repo, prNumber }) {
 // Entry point for actions/github-script. The schedule's sweep is the retry net
 // for event runs that failed or were never delivered, and the only trigger
 // guaranteed to follow a verdict delivered as a PR review, since review events
-// must never trigger this (see pr-gate.yml).
+// must never trigger this (see pr-gate.yml). A repository_dispatch sweeps too:
+// a reaction triggers nothing, so whoever sees Codex's 👍 dispatches one rather
+// than wait hours for the schedule.
 async function run({ github, context, core }) {
   const { owner, repo } = context.repo;
   const { pull_request: pullRequest, issue } = context.payload;
