@@ -32,19 +32,21 @@ const review = (login, body, submitted, state = 'COMMENTED') => ({
   submitted_at: submitted,
   state,
 });
-// A reaction on the PR description, and an event from the PR's issue events.
+// A reaction on the PR description, and events from the PR's issue events.
 const reaction = (login, content, created) => ({ user: login === null ? null : { login }, content, created_at: created });
-const event = (name, created) => ({ event: name, created_at: created });
 const THUMBS_UP = (at) => reaction(CODEX, '+1', at);
 const EYES = (at) => reaction(CODEX, 'eyes', at);
-const READY = (at) => event('ready_for_review', at);
-const FORCE_PUSH = (at) => event('head_ref_force_pushed', at);
+const READY = (at) => ({ event: 'ready_for_review', created_at: at });
+const DRAFTED = (at) => ({ event: 'convert_to_draft', created_at: at });
+// commit_id is the commit the force-push moved the branch to.
+const FORCE_PUSH = (at, commit = HEAD) => ({ event: 'head_ref_force_pushed', created_at: at, commit_id: commit });
 
 const BEFORE = '2025-12-31T23:00:00Z';
 const T0 = '2026-01-01T00:00:00Z'; // the head was pushed
 const T1 = '2026-01-01T00:05:00Z';
 const T2 = '2026-01-01T00:10:00Z';
 const T3 = '2026-01-01T00:15:00Z';
+const T4 = '2026-01-01T00:20:00Z';
 
 const codex = (given) =>
   gate.codexStatus({
@@ -53,6 +55,7 @@ const codex = (given) =>
     reactions: [],
     events: [],
     openedAt: BEFORE,
+    draft: false,
     head: HEAD,
     headPushedAt: Date.parse(T0),
     ...given,
@@ -260,18 +263,31 @@ test('waiver: whitespace around the message is not part of it', () => {
 // ------------------------------------------------------ codex-review: Codex's 👍
 
 const NOT_TIED = `Codex's 👍 is not tied to ${HEAD10}; comment @codex review`;
+const TIED = `Codex found no major issues in ${HEAD10} (👍 on the PR)`;
+const REVIEWING = `Codex is reviewing; waiting for its verdict on ${HEAD10}`;
+const RESPONDED = `Codex responded, but no verdict names ${HEAD10}`;
+// After the PR's first ready request at BEFORE, before the head's push at T0.
+const EARLIER = '2025-12-31T23:30:00Z';
 
-test('thumbs: a 👍 after the PR was marked ready, after the push, is a clean verdict for the head', () => {
+test('thumbs: a 👍 after a draft PR was marked ready, after the push, is a clean verdict for the head', () => {
   const s = codex({ events: [READY(T1)], reactions: [THUMBS_UP(T2)] });
   assert.equal(s.state, 'success');
-  assert.equal(s.description, `Codex found no major issues in ${HEAD10}`);
+  assert.equal(s.description, TIED);
 });
 
-test('thumbs: a 👍 on a PR opened after the push is a clean verdict for the head', () => {
-  assert.equal(codex({ openedAt: T1, reactions: [THUMBS_UP(T2)] }).state, 'success');
+test('thumbs: a 👍 on a PR opened ready for review after the push is a clean verdict for the head', () => {
+  const s = codex({ openedAt: T1, reactions: [THUMBS_UP(T2)] });
+  assert.equal(s.state, 'success');
+  assert.equal(s.description, TIED);
 });
 
-test('thumbs: a 👍 with no review request since the push does not count, and the status says to re-request', () => {
+test('thumbs: opening a PR as a draft is not a review request', () => {
+  // Still a draft, or a draft marked ready only after the 👍.
+  assert.equal(codex({ openedAt: T1, draft: true, reactions: [THUMBS_UP(T2)] }).description, NOT_TIED);
+  assert.equal(codex({ openedAt: T1, events: [READY(T3)], reactions: [THUMBS_UP(T2)] }).description, NOT_TIED);
+});
+
+test('thumbs: a 👍 with no ready request since the push does not count, and the status says to re-request', () => {
   // Codex reviews some pushes unasked but not all, so a 👍 after one may be an
   // older review finishing.
   for (const events of [[], [READY(BEFORE)], [READY(T0)]]) {
@@ -294,17 +310,56 @@ test('thumbs: an @codex review comment is not a request a 👍 answers', () => {
   assert.equal(s.description, NOT_TIED);
 });
 
-test('thumbs: a force-push after the request voids it, and one before it does not', () => {
-  assert.equal(codex({ events: [READY(T1), FORCE_PUSH(T2)], reactions: [THUMBS_UP(T3)] }).state, 'pending');
-  assert.equal(codex({ events: [READY(T1), FORCE_PUSH(T1)], reactions: [THUMBS_UP(T3)] }).state, 'pending');
-  assert.equal(codex({ events: [FORCE_PUSH(T0), READY(T1)], reactions: [THUMBS_UP(T2)] }).state, 'success');
+test('thumbs: once the PR was ready for review before the head arrived, no 👍 counts', () => {
+  // A review Codex started on the older head can finish after a later ready
+  // request, and its 👍 looks the same as one for the head.
+  const reReady = codex({ events: [READY(BEFORE), DRAFTED(EARLIER), READY(T1)], reactions: [THUMBS_UP(T2)] });
+  assert.equal(reReady.description, NOT_TIED);
+  const openedReady = codex({ openedAt: BEFORE, events: [DRAFTED(EARLIER), READY(T1)], reactions: [THUMBS_UP(T2)] });
+  assert.equal(openedReady.description, NOT_TIED);
+});
+
+test('thumbs: whether the PR was opened as a draft is read from its earliest transition, whatever order they are listed in', () => {
+  const s = codex({ events: [READY(T1), DRAFTED(EARLIER)], reactions: [THUMBS_UP(T2)] });
+  assert.equal(s.description, NOT_TIED);
+});
+
+test('thumbs: a head moved after the PR was first ready ties no 👍, even across a later ready', () => {
+  // Codex may have reviewed whatever the branch pointed at in between.
+  for (const moved of [FORCE_PUSH(T2), FORCE_PUSH(T2, OTHER), FORCE_PUSH(T1)]) {
+    const events = [READY(T1), moved, DRAFTED(T2), READY(T3)];
+    assert.equal(codex({ events, reactions: [THUMBS_UP(T4)] }).description, NOT_TIED, JSON.stringify(moved));
+  }
+});
+
+test('thumbs: a head brought by a force-push before the PR became ready arrived with that force-push', () => {
+  assert.equal(codex({ events: [FORCE_PUSH(T1), READY(T2)], reactions: [THUMBS_UP(T3)] }).description, TIED);
+  // The head's check suite dates its first push, before it left the branch and came back.
+  const back = { events: [FORCE_PUSH(T1), READY(T2)], reactions: [THUMBS_UP(T3)], headPushedAt: Date.parse(BEFORE) };
+  assert.equal(codex(back).description, TIED);
+});
+
+test('thumbs: a force-push to another commit after the head was pushed leaves its arrival unknown', () => {
+  // The head came back by a later push that no event records.
+  assert.equal(codex({ events: [FORCE_PUSH(T1, OTHER), READY(T2)], reactions: [THUMBS_UP(T3)] }).description, NOT_TIED);
+  assert.equal(codex({ events: [FORCE_PUSH(T0, OTHER), READY(T1)], reactions: [THUMBS_UP(T2)] }).description, NOT_TIED);
+  // One before the head was first pushed says nothing about it.
+  assert.equal(codex({ events: [FORCE_PUSH(BEFORE, OTHER), READY(T1)], reactions: [THUMBS_UP(T2)] }).description, TIED);
+});
+
+test('thumbs: the last force-push since the head was pushed decides, whatever order the events are listed in', () => {
+  const back = [READY(T3), FORCE_PUSH(T2), FORCE_PUSH(T1, OTHER)];
+  assert.equal(codex({ events: back, reactions: [THUMBS_UP(T4)] }).description, TIED);
+  const away = [READY(T3), FORCE_PUSH(T2, OTHER), FORCE_PUSH(T1)];
+  assert.equal(codex({ events: away, reactions: [THUMBS_UP(T4)] }).description, NOT_TIED);
 });
 
 test('thumbs: a Codex verdict on another commit after the request voids it, before or after the 👍', () => {
-  // An older review was still running when the request came, and its 👍 looks
-  // the same as the one the request earned.
+  // A review requested by comment was still running when the request came, and
+  // its 👍 looks the same as the one the request earned.
   for (const [stale, thumbsUp] of [
     [comment(CODEX, CLEAN(OTHER), T2), T3],
+    [comment(CODEX, CLEAN(OTHER), T1), T3],
     [comment(CODEX, CLEAN(OTHER), T3), T2],
     [comment(CODEX, FINDINGS(OTHER), T2), T3],
   ]) {
@@ -315,17 +370,42 @@ test('thumbs: a Codex verdict on another commit after the request voids it, befo
   assert.equal(codex({ reviews: [asReview], events: [READY(T1)], reactions: [THUMBS_UP(T3)] }).state, 'pending');
 });
 
+test('thumbs: a later ready request ties the 👍 again after a verdict on another commit voided an earlier one', () => {
+  const s = codex({
+    comments: [comment(CODEX, CLEAN(OTHER), T2)],
+    events: [READY(T1), DRAFTED(T2), READY(T3)],
+    reactions: [THUMBS_UP(T4)],
+  });
+  assert.equal(s.description, TIED);
+});
+
 test('thumbs: a verdict on another commit from before the request does not void it', () => {
   const s = codex({ comments: [comment(CODEX, FINDINGS(OTHER), BEFORE)], events: [READY(T1)], reactions: [THUMBS_UP(T2)] });
   assert.equal(s.state, 'success');
 });
 
-test('thumbs: a 👍 does not count while Codex shows 👀 on the description', () => {
-  assert.equal(codex({ events: [READY(T1)], reactions: [THUMBS_UP(T2), EYES(T3)] }).state, 'pending');
+test('thumbs: while Codex shows 👀 on the description nothing counts, and the status says it is reviewing', () => {
+  for (const reactions of [[THUMBS_UP(T2), EYES(T3)], [EYES(T3)]]) {
+    const s = codex({ events: [READY(T1)], reactions });
+    assert.equal(s.state, 'pending', JSON.stringify(reactions));
+    assert.equal(s.description, REVIEWING);
+  }
 });
 
-test('thumbs: a push that cannot be dated never ties a 👍 to the head', () => {
-  assert.equal(codex({ events: [READY(T1)], reactions: [THUMBS_UP(T2)], headPushedAt: null }).state, 'pending');
+test('thumbs: a push that cannot be dated ties no 👍, and the status says why', () => {
+  const s = codex({ events: [READY(T1)], reactions: [THUMBS_UP(T2)], headPushedAt: null });
+  assert.equal(s.state, 'pending');
+  assert.equal(s.description, `Codex's 👍 is not counted: ${HEAD10} has no check suite to date its push`);
+});
+
+test('thumbs: whatever the 👍 says, the notice that Codex responded without naming the head stays', () => {
+  const voided = codex({ comments: [comment(CODEX, CLEAN(OTHER), T2)], events: [READY(T1)], reactions: [THUMBS_UP(T3)] });
+  const reworded = codex({ comments: [comment(CODEX, 'Codex had a look; all fine.', T2)], reactions: [THUMBS_UP(T3)] });
+  const reviewing = codex({ comments: [comment(CODEX, CLEAN(OTHER), T2)], reactions: [EYES(T3)] });
+  for (const [s, description] of [[voided, NOT_TIED], [reworded, NOT_TIED], [reviewing, REVIEWING]]) {
+    assert.equal(s.description, description);
+    assert.equal(s.notice, RESPONDED);
+  }
 });
 
 test('thumbs: the 👍 ranks among the verdicts on the head at its own time, losing a tie', () => {
@@ -345,14 +425,23 @@ test('thumbs: a 👍 from anyone but Codex, and any other Codex reaction, is not
 
 test('thumbs: a counted 👍 outranks the waiver, and one that does not count leaves the waiver to apply', () => {
   const counted = codex({ comments: [comment(CODEX, LIMIT, T1)], events: [READY(T1)], reactions: [THUMBS_UP(T2)] });
-  assert.equal(counted.description, `Codex found no major issues in ${HEAD10}`);
+  assert.equal(counted.description, TIED);
   const untied = codex({ comments: [comment(CODEX, LIMIT, T1)], reactions: [THUMBS_UP(T2)] });
   assert.match(untied.description, /^WAIVED:/);
 });
 
+test('thumbs: a PR without a boolean draft flag is an error, never a guess', () => {
+  assert.throws(() => codex({ draft: undefined, reactions: [THUMBS_UP(T2)] }), /draft flag/);
+});
+
 test('thumbs: an event or reaction without a parseable timestamp is an error, never a guess', () => {
-  assert.throws(() => codex({ events: [READY(undefined)], reactions: [THUMBS_UP(T2)] }), /no valid timestamp/);
-  assert.throws(() => codex({ events: [READY(T1)], reactions: [THUMBS_UP('soon')] }), /no valid timestamp/);
+  for (const given of [
+    { events: [READY(undefined)], reactions: [THUMBS_UP(T2)] },
+    { events: [READY(T1), FORCE_PUSH('never')], reactions: [THUMBS_UP(T2)] },
+    { events: [READY(T1)], reactions: [THUMBS_UP('soon')] },
+  ]) {
+    assert.throws(() => codex(given), /no valid timestamp/, JSON.stringify(given));
+  }
 });
 
 // -------------------------------------------------------------- internal-review
@@ -490,6 +579,7 @@ const openPr = (number = 7) => ({
   html_url: `https://example.test/pr/${number}`,
   created_at: BEFORE,
   updated_at: T3,
+  draft: false,
 });
 const ctx = (payload) => ({ repo: { owner: 'o', repo: 'r' }, payload });
 const pushEvent = ctx({ pull_request: { number: 7, head: { sha: HEAD }, updated_at: T3 } });
@@ -633,11 +723,15 @@ test('run: the gate\'s own earlier statuses never date the head', async () => {
   }
 });
 
-test('run: a Codex 👍 is read from the description\'s reactions and tied to the PR\'s opening and events', async () => {
-  for (const [pr, events] of [[openPr(), [READY(T1)]], [{ ...openPr(), created_at: T1 }, []]]) {
+test('run: a Codex 👍 is read from the description\'s reactions and tied by the PR\'s draft flag and events', async () => {
+  for (const [pr, events, expected] of [
+    [openPr(), [READY(T1)], ['success', TIED]],
+    [{ ...openPr(), created_at: T1 }, [], ['success', TIED]],
+    [{ ...openPr(), created_at: T1, draft: true }, [], ['pending', NOT_TIED]],
+  ]) {
     const { github, posted } = fakeGithub({ prs: [pr], commentsByCall: [[]], reactions: [THUMBS_UP(T2)], events });
     await gate.run({ github, context: pushEvent, core: fakeCore().core });
-    assert.deepEqual(of(posted, 'codex-review').map((s) => [s.state, s.description]), [['success', CLEAN_DESCRIPTION]]);
+    assert.deepEqual(of(posted, 'codex-review').map((s) => [s.state, s.description]), [expected], JSON.stringify(pr));
   }
 });
 

@@ -205,23 +205,40 @@ If Codex says nothing at all, nothing is waived.
 
 ### The Codex thumbs-up
 
-Codex also reviews a PR unasked: when it is opened, and each time it is marked
-ready for review. A clean review of that kind gets no comment, only a 👍 on the
-PR description, which Codex swaps for 👀 while a review runs. The 👍 names no
-commit, so it counts as a clean verdict, ranked at the time it was given, only
-when the request it answers was provably for the head:
+Codex also reviews a PR unasked: when it is opened ready for review, and each
+time it is marked ready. A clean review of that kind gets no comment, only a 👍
+on the PR description, which Codex swaps for 👀 while a review runs. The 👍
+names no commit, so it counts as a clean verdict, ranked at the time it was
+given, only when no review that could have earned it read another commit:
 
-- the PR was opened or marked ready **after the head was pushed** (dated as for
-  the waiver), and the 👍 came after that;
-- **no force-push** came after that request: one could have swapped the
-  reviewed commit out and the head back in;
-- **no Codex verdict naming another commit** came after that request: that is a
-  review of an older commit still finishing, and its 👍 looks the same;
+- the head **arrived before the PR was first ready for review**. That is its
+  opening, or, for a PR opened as a draft, the first time it was marked ready.
+  The head arrived when it was first pushed (dated as for the waiver), unless
+  the branch was force-pushed since: the last such force-push is when it
+  arrived if it moved the branch to the head, and if it moved it to another
+  commit, nothing dates the head's return and no 👍 counts;
+- the 👍 came **after a ready request with no Codex verdict naming another
+  commit** at or after it: that is a review requested by `@codex review` still
+  finishing, and its 👍 looks the same. A later ready request ties the 👍
+  again;
 - Codex shows **no 👀** on the description, so no review is still running.
 
-A 👍 that does not qualify leaves the status at `Codex's 👍 is not tied to
-<sha>; comment @codex review`. Codex answers that comment with a verdict naming
+A tie in time counts against the 👍. So the 👍 counts on a PR opened as a
+draft and marked ready once its commits are in, including after later
+re-readies with no push in between. Once the head moves after the PR was first
+ready, only `@codex review` gets a verdict: Codex answers it with one naming
 the commit.
+
+A counted 👍 reads `Codex found no major issues in <sha> (👍 on the PR)`, so it
+is never mistaken for a verdict naming the commit. When no verdict names the
+head and Codex is not out of credits, the status says what the description
+shows:
+
+| Description | When |
+|---|---|
+| `Codex is reviewing; waiting for its verdict on <sha>` | Codex shows 👀 |
+| `Codex's 👍 is not counted: <sha> has no check suite to date its push` | a 👍, but the push cannot be dated |
+| `Codex's 👍 is not tied to <sha>; comment @codex review` | any other 👍 |
 
 A reaction triggers no workflow, so nothing re-runs the gate when the 👍
 arrives; the next event or scheduled sweep would. To have it counted now, send
@@ -234,10 +251,11 @@ gh api repos/<owner>/<repo>/dispatches -f event_type=pr-gate
 
 ### What is deliberately not honored
 
-- **A 👍 whose only request since the push is the push itself, or an
-  `@codex review` comment.** Codex reviews some pushes unasked but not all, so
-  a 👍 after one can be an older review finishing. Codex answers
-  `@codex review` with a verdict naming the commit, which counts on its own.
+- **A 👍 after the head moved on a PR that was ready for review**, whatever
+  requests follow. Codex reviews some pushes to a ready PR unasked but not
+  all, so a 👍 after one can be an older review finishing.
+- **An `@codex review` comment as a request a 👍 answers.** Codex answers it
+  with a verdict naming the commit, which counts on its own.
 - **A commit prefix under 10 hex digits**, in either status. Ten is what Codex
   emits; accepting fewer would make it cheaper to craft a commit whose SHA
   collides with a stale verdict's prefix after a force-push.
@@ -303,13 +321,14 @@ bumping a pin. Pinning `uses:` to a SHA pins the workflow file, not the rules.
   until the gate is updated.
 - **A push is dated by when the commit first reached GitHub**, which is earlier
   than when it became this PR's head if it sat on another branch first. An
-  out-of-credits answer from that interval then counts for it, and so does a
-  👍 answering a request from that interval, unless the head arrived by
-  force-push.
-- **Two of Codex's own reviews can overlap.** If a PR is converted to draft,
-  pushed and marked ready again while Codex is still reviewing an older commit,
-  that review's 👍 can land after the new request and count for the new head.
-  The new review's verdict supersedes it once the gate runs again.
+  out-of-credits answer from that interval then counts for it, and a 👍 can
+  count although the PR was ready for review before the head reached it,
+  unless the head arrived by force-push.
+- **A review requested by comment could end in a bare 👍.** If one requested
+  by `@codex review` on an older commit is still running when the PR is first
+  marked ready, and Codex answers it with only a 👍 on the description, that
+  👍 counts for the head. Codex normally answers that request with a verdict
+  comment naming the commit, which voids the tie.
 - **Statuses belong to a commit, not a PR.** Two open PRs sharing a head SHA
   overwrite each other's statuses.
 - **A stale `success` is revoked by the next event or sweep, not instantly.**
