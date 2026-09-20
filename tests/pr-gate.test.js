@@ -48,19 +48,34 @@ const T2 = '2026-01-01T00:10:00Z';
 const T3 = '2026-01-01T00:15:00Z';
 const T4 = '2026-01-01T00:20:00Z';
 
+// The status API rejects a description it cannot store: over 140 characters, or
+// carrying a character outside the BMP — "Validation failed: Description
+// doesn't accept 4-byte Unicode". A rejected post throws, and the failure
+// handler then stamps every context `error`, so an emoji in any one description
+// turns a passing PR into a blocked one. Every status a test builds is checked
+// here, which is the only place that grades the wording against the API.
+const postable = (status) => {
+  const outsideBmp = [...status.description].filter((c) => c.codePointAt(0) > 0xffff);
+  assert.deepEqual(outsideBmp, [], `4-byte Unicode in: ${status.description}`);
+  assert.ok(status.description.length <= 140, `over 140 characters: ${status.description}`);
+  return status;
+};
+
 const codex = (given) =>
-  gate.codexStatus({
-    comments: [],
-    reviews: [],
-    reactions: [],
-    events: [],
-    openedAt: BEFORE,
-    draft: false,
-    head: HEAD,
-    headPushedAt: Date.parse(T0),
-    ...given,
-  });
-const internal = (comments) => gate.internalReviewStatus({ comments, head: HEAD });
+  postable(
+    gate.codexStatus({
+      comments: [],
+      reviews: [],
+      reactions: [],
+      events: [],
+      openedAt: BEFORE,
+      draft: false,
+      head: HEAD,
+      headPushedAt: Date.parse(T0),
+      ...given,
+    }),
+  );
+const internal = (comments) => postable(gate.internalReviewStatus({ comments, head: HEAD }));
 
 // ------------------------------------------------------- codex-review: verdicts
 
@@ -262,11 +277,11 @@ test('waiver: whitespace around the message is not part of it', () => {
 
 // ------------------------------------------------------ codex-review: Codex's 👍
 
-const NOT_TIED = `Codex's 👍 is not tied to ${HEAD10}; comment @codex review`;
-const TIED = `Codex found no major issues in ${HEAD10} (👍 on the PR)`;
+const NOT_TIED = `Codex's thumbs-up is not tied to ${HEAD10}; comment @codex review`;
+const TIED = `Codex found no major issues in ${HEAD10} (thumbs-up on the PR)`;
 const REVIEWING = `Codex is reviewing; waiting for its verdict on ${HEAD10}`;
 const RESPONDED = `Codex responded, but no verdict names ${HEAD10}`;
-const UNDATED = `Codex's 👍 is not counted: ${HEAD10} has no check suite to date its push`;
+const UNDATED = `Codex's thumbs-up is not counted: ${HEAD10} has no check suite to date its push`;
 // After the PR's first ready request at BEFORE, before the head's push at T0.
 const EARLIER = '2025-12-31T23:30:00Z';
 

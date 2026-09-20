@@ -48,7 +48,8 @@ const ATTESTATION_MARKER = '<!-- analitiq-internal-review -->';
 // shell, where backticks are the first thing to get mangled.
 const ATTESTED_COMMIT = /\*{0,2}Reviewed commit:\*{0,2}\s*[`'"]?([0-9a-f]{10,40})/gi;
 
-// GitHub rejects a longer status description.
+// GitHub rejects a longer status description, and one carrying 4-byte Unicode,
+// so a description spells out in words the reaction it cannot hold: 👍, 👀.
 const MAX_STATUS_DESCRIPTION = 140;
 
 const short = (sha) => sha.slice(0, 10);
@@ -117,7 +118,7 @@ function codexReactionAnswer({ responses, reactions, events, openedAt, draft, he
   const [thumbsUp] = codexReactions(reactions, THUMBS_UP);
   if (thumbsUp === undefined) return null;
   if (headPushedAt === null) {
-    return { pending: `Codex's 👍 is not counted: ${short(head)} has no check suite to date its push` };
+    return { pending: `Codex's thumbs-up is not counted: ${short(head)} has no check suite to date its push` };
   }
 
   const at = timestamp(thumbsUp.created_at, 'Codex reaction');
@@ -133,7 +134,7 @@ function codexReactionAnswer({ responses, reactions, events, openedAt, draft, he
     requests.some((requested) => requested < at && !voids.some((voided) => voided >= requested));
   return tied
     ? { verdict: { clean: true, at, byThumbsUp: true } }
-    : { pending: `Codex's 👍 is not tied to ${short(head)}; comment @codex review` };
+    : { pending: `Codex's thumbs-up is not tied to ${short(head)}; comment @codex review` };
 }
 
 // Codex's out-of-credits answer names no commit, so its age against the push
@@ -193,7 +194,7 @@ function codexStatus({ comments, reviews, reactions, events, openedAt, draft, he
   if (latest !== undefined) {
     if (latest.clean) {
       const found = `Codex found no major issues in ${short(head)}`;
-      return { state: 'success', description: latest.byThumbsUp ? `${found} (👍 on the PR)` : found };
+      return { state: 'success', description: latest.byThumbsUp ? `${found} (thumbs-up on the PR)` : found };
     }
     return {
       state: 'pending',
