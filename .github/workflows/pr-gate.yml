@@ -45,7 +45,7 @@ jobs:
           EVENT: ${{ github.event_name }}
         run: |
           case "$EVENT" in
-            pull_request_target|issue_comment|schedule) ;;
+            pull_request_target|issue_comment|schedule|repository_dispatch) ;;
             *) echo "::error::pr-gate must not be triggered by '$EVENT'"; exit 1 ;;
           esac
 

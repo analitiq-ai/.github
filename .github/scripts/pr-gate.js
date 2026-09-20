@@ -11,12 +11,13 @@
 // verdict for the old head must stop counting without anyone remembering to
 // revoke it.
 //
-// Reactions are deliberately not honored as verdicts. A +1 names no commit, so
-// tying it to a head needs timestamp heuristics that are either forgeable or
-// wedge valid approvals.
+// Codex's 👍 names no commit, so it counts only when every review that could
+// have earned it read the head (see codexReactionAnswer).
 
 const CODEX = 'chatgpt-codex-connector[bot]';
 const CODEX_CONTEXT = 'codex-review';
+const THUMBS_UP = '+1';
+const REVIEWING = 'eyes';
 
 // Line-anchored to Codex's clean-verdict template. The findings preamble
 // rejects a body outright, because a findings review can legitimately open a
@@ -66,11 +67,95 @@ function timestamp(value, what) {
 const namesHead = (body, pattern, head) =>
   [...body.matchAll(pattern)].some((match) => head.startsWith(match[1].toLowerCase()));
 
-// headPushedAt: when the head commit reached GitHub, in epoch milliseconds,
-//   or null when that is unknown. Codex's out-of-credits answer names no commit, so its age against
-//   the push is the only thing tying it to this head: an answer older than the
-//   push says nothing about whether credits have returned since.
-function codexStatus({ comments, reviews, head, headPushedAt }) {
+const codexReactions = (reactions, content) => reactions.filter((r) => authoredBy(r, CODEX) && r.content === content);
+
+// Codex reviews a PR unasked when it is opened ready for review and each time
+// it is marked ready. It was opened as a draft if its first transition marked
+// it ready, or, with none, if it is a draft still.
+function readyRequests({ events, openedAt, draft }) {
+  if (typeof draft !== 'boolean') throw new Error(`pull request has no draft flag: ${JSON.stringify(draft)}`);
+  const transitions = events
+    .filter((e) => e.event === 'ready_for_review' || e.event === 'convert_to_draft')
+    .map((e) => ({ readied: e.event === 'ready_for_review', at: timestamp(e.created_at, `${e.event} event`) }))
+    .sort((a, b) => a.at - b.at);
+  const openedAsDraft = transitions.length > 0 ? transitions[0].readied : draft;
+  const readied = transitions.filter((t) => t.readied).map((t) => t.at);
+  return openedAsDraft ? readied : [timestamp(openedAt, 'pull request'), ...readied];
+}
+
+// The head's first push is dated by its earliest check suite. The last
+// force-push since then decides: one to the head is when it arrived; after one
+// to another commit, the head came back by a push no event records.
+function headArrivedAt({ events, head, headPushedAt }) {
+  const moves = events
+    .filter((e) => e.event === 'head_ref_force_pushed')
+    .map((e) => ({ to: e.commit_id, at: timestamp(e.created_at, 'head_ref_force_pushed event') }))
+    .filter((move) => move.at >= headPushedAt)
+    .sort((a, b) => a.at - b.at);
+  const last = moves[moves.length - 1];
+  if (last === undefined) return headPushedAt;
+  return last.to === head ? last.at : null;
+}
+
+// Codex answers a clean review it made unasked with nothing but a 👍 on the
+// description, and shows 👀 there while a review runs. The 👍 names no commit,
+// so it counts, as a clean verdict at its own time, only when no review that
+// could have earned it read another commit:
+//   - the head arrived before the first ready request: until then Codex
+//     reviews nothing unasked, and after it the head never moved;
+//   - it came after a ready request with no Codex verdict on another commit
+//     since: that is a review requested by comment still finishing, and its 👍
+//     looks the same.
+// `@codex review` comments are not such requests: Codex answers them with a
+// verdict naming the commit, which counts on its own.
+// Returns that verdict, or why there is none; null when Codex shows neither.
+function codexReactionAnswer({ responses, reactions, events, openedAt, draft, head, headPushedAt }) {
+  if (codexReactions(reactions, REVIEWING).length > 0) {
+    return { pending: `Codex is reviewing; waiting for its verdict on ${short(head)}`, reviewing: true };
+  }
+  // GitHub keeps one reaction per user and content.
+  const [thumbsUp] = codexReactions(reactions, THUMBS_UP);
+  if (thumbsUp === undefined) return null;
+  if (headPushedAt === null) {
+    return { pending: `Codex's 👍 is not counted: ${short(head)} has no check suite to date its push` };
+  }
+
+  const at = timestamp(thumbsUp.created_at, 'Codex reaction');
+  const requests = readyRequests({ events, openedAt, draft });
+  const arrived = headArrivedAt({ events, head, headPushedAt });
+  const voids = responses
+    .filter((r) => r.body.search(CODEX_REVIEWED_COMMIT) !== -1 && !namesHead(r.body, CODEX_REVIEWED_COMMIT, head))
+    .map((r) => r.created);
+  // Every tie is ordered against the 👍.
+  const tied =
+    arrived !== null &&
+    requests.every((requested) => arrived < requested) &&
+    requests.some((requested) => requested < at && !voids.some((voided) => voided >= requested));
+  return tied
+    ? { verdict: { clean: true, at, byThumbsUp: true } }
+    : { pending: `Codex's 👍 is not tied to ${short(head)}; comment @codex review` };
+}
+
+// Codex's out-of-credits answer names no commit, so its age against the push
+// is the only thing tying it to this head: an answer older than the push says
+// nothing about whether credits have returned since. Returns whether it waives
+// the head, or why not; null when Codex never gave it.
+function outOfCreditsAnswer({ codexComments, head, headPushedAt }) {
+  const answers = codexComments.filter((c) => (c.body || '').trim() === USAGE_LIMIT_MESSAGE);
+  if (answers.length === 0) return null;
+  if (headPushedAt === null) {
+    return { pending: `Codex is out of credits; ${short(head)} has no check suite to date its push, so it is not waived` };
+  }
+  // Dated by creation: an edit must not be able to make an old answer recent.
+  if (answers.some((c) => timestamp(c.created_at, 'Codex comment') > headPushedAt)) return { waives: true };
+  return { pending: `Codex's out-of-credits answer predates ${short(head)}; comment @codex review` };
+}
+
+// headPushedAt: when the head commit reached GitHub, in epoch milliseconds, or
+//   null when that is unknown.
+// reactions: those on the PR description. events: the PR's issue events.
+// openedAt: when the PR was opened. draft: whether it is a draft now.
+function codexStatus({ comments, reviews, reactions, events, openedAt, draft, head, headPushedAt }) {
   const codexComments = comments.filter((c) => authoredBy(c, CODEX));
 
   const responses = codexComments
@@ -89,57 +174,56 @@ function codexStatus({ comments, reviews, head, headPushedAt }) {
           return { body: r.body || '', created: submitted, edited: submitted };
         }),
     );
+  const reactionAnswer = codexReactionAnswer({ responses, reactions, events, openedAt, draft, head, headPushedAt });
 
-  // The newest verdict naming this exact commit decides. A clean verdict ranks
-  // at its creation and a findings verdict at its last edit, so an edit can
-  // void an approval but can never revive one that a later review overruled.
+  // The newest verdict on this exact commit decides. A clean verdict ranks at
+  // its creation and a findings verdict at its last edit, so an edit can void
+  // an approval but can never revive one that a later review overruled.
   const verdicts = responses
     .filter((r) => namesHead(r.body, CODEX_REVIEWED_COMMIT, head))
     .map((r) => {
       const clean = CLEAN.test(r.body) && !FINDINGS.test(r.body);
       return { clean, at: clean ? r.created : Math.max(r.created, r.edited) };
     })
+    .concat(reactionAnswer?.verdict ?? [])
     // At the same instant the non-clean verdict sorts last, and so decides.
     .sort((a, b) => a.at - b.at || Number(b.clean) - Number(a.clean));
   const latest = verdicts[verdicts.length - 1];
 
   if (latest !== undefined) {
-    return latest.clean
-      ? { state: 'success', description: `Codex found no major issues in ${short(head)}` }
-      : {
-          state: 'pending',
-          description: `No clean Codex verdict for ${short(head)} yet`,
-          notice: `Codex's newest verdict for ${short(head)} is not its clean template`,
-        };
-  }
-
-  // The waiver only fills the absence of a verdict; it never outranks one.
-  const outOfCredits = codexComments.filter((c) => (c.body || '').trim() === USAGE_LIMIT_MESSAGE);
-  if (outOfCredits.length === 0) {
-    return responses.length > 0
-      ? {
-          state: 'pending',
-          description: `No clean Codex verdict for ${short(head)} yet`,
-          // If Codex rewords its template, this is the only trace that it
-          // answered at all.
-          notice: `Codex responded, but no verdict names ${short(head)}`,
-        }
-      : { state: 'pending', description: `Waiting for a Codex review of ${short(head)}` };
-  }
-  if (headPushedAt === null) {
+    if (latest.clean) {
+      const found = `Codex found no major issues in ${short(head)}`;
+      return { state: 'success', description: latest.byThumbsUp ? `${found} (👍 on the PR)` : found };
+    }
     return {
       state: 'pending',
-      description: `Codex is out of credits; ${short(head)} has no check suite to date its push, so it is not waived`,
+      description: `No clean Codex verdict for ${short(head)} yet`,
+      notice: `Codex's newest verdict for ${short(head)} is not its clean template`,
     };
   }
-  // Dated by creation: an edit must not be able to make an old answer recent.
-  if (outOfCredits.some((c) => timestamp(c.created_at, 'Codex comment') > headPushedAt)) {
+
+  // The waiver only fills the absence of a verdict, and never while Codex shows
+  // 👀: a review is running, and its answer, a verdict or a fresh
+  // out-of-credits reply, is minutes away.
+  const credits = outOfCreditsAnswer({ codexComments, head, headPushedAt });
+  if (credits?.waives && !reactionAnswer?.reviewing) {
     return { state: 'success', description: `WAIVED: Codex is out of credits; ${short(head)} was not reviewed` };
   }
-  return {
-    state: 'pending',
-    description: `Codex's out-of-credits answer predates ${short(head)}; comment @codex review`,
-  };
+  const description =
+    reactionAnswer?.pending ??
+    credits?.pending ??
+    (responses.length > 0
+      ? `No clean Codex verdict for ${short(head)} yet`
+      : `Waiting for a Codex review of ${short(head)}`);
+  return responses.length > 0
+    ? {
+        state: 'pending',
+        description,
+        // If Codex rewords its template, this is the only trace that it
+        // answered at all.
+        notice: `Codex responded, but no verdict names ${short(head)}`,
+      }
+    : { state: 'pending', description };
 }
 
 function internalReviewStatus({ comments, head }) {
@@ -198,6 +282,18 @@ async function readStatuses({ github, owner, repo, pr }) {
     pull_number: pr.number,
     per_page: 100,
   });
+  const reactions = await github.paginate(github.rest.reactions.listForIssue, {
+    owner,
+    repo,
+    issue_number: pr.number,
+    per_page: 100,
+  });
+  const events = await github.paginate(github.rest.issues.listEvents, {
+    owner,
+    repo,
+    issue_number: pr.number,
+    per_page: 100,
+  });
 
   // GitHub opens a check suite per installed app the moment a commit is
   // pushed. It is the one server-side record of that moment every run can
@@ -213,7 +309,16 @@ async function readStatuses({ github, owner, repo, pr }) {
   const headPushedAt = pushTimes.length > 0 ? Math.min(...pushTimes) : null;
 
   return {
-    [CODEX_CONTEXT]: codexStatus({ comments, reviews, head, headPushedAt }),
+    [CODEX_CONTEXT]: codexStatus({
+      comments,
+      reviews,
+      reactions,
+      events,
+      openedAt: pr.created_at,
+      draft: pr.draft,
+      head,
+      headPushedAt,
+    }),
     [INTERNAL_CONTEXT]: internalReviewStatus({ comments, head }),
   };
 }
@@ -277,7 +382,9 @@ async function evaluate({ github, core, owner, repo, prNumber }) {
 // Entry point for actions/github-script. The schedule's sweep is the retry net
 // for event runs that failed or were never delivered, and the only trigger
 // guaranteed to follow a verdict delivered as a PR review, since review events
-// must never trigger this (see pr-gate.yml).
+// must never trigger this (see pr-gate.yml). A repository_dispatch sweeps too:
+// a reaction triggers nothing, so whoever sees Codex's 👍 dispatches one rather
+// than wait for the next scheduled sweep.
 async function run({ github, context, core }) {
   const { owner, repo } = context.repo;
   const { pull_request: pullRequest, issue } = context.payload;
