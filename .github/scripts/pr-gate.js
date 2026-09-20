@@ -48,8 +48,19 @@ const ATTESTATION_MARKER = '<!-- analitiq-internal-review -->';
 // shell, where backticks are the first thing to get mangled.
 const ATTESTED_COMMIT = /\*{0,2}Reviewed commit:\*{0,2}\s*[`'"]?([0-9a-f]{10,40})/gi;
 
-// GitHub rejects a longer status description.
 const MAX_STATUS_DESCRIPTION = 140;
+// GitHub rejects a longer status description, and one carrying a character
+// outside the BMP ("Description doesn't accept 4-byte Unicode") — which is what
+// 👍 and 👀 are. The gate words its own descriptions to fit; an error's
+// message is not its to word, so every description is repaired here, at the one
+// boundary they all cross. Repairing before the cut leaves no surrogate pair for
+// it to split.
+const postable = (description) => description.replace(/[^\u{0}-\u{FFFF}]/gu, '?').slice(0, MAX_STATUS_DESCRIPTION);
+
+// The gate's wording around an error it did not write. Named so a test builds the
+// crash text from here instead of keeping its own copy; what a crash posts is
+// this, repaired by postable.
+const crashDescription = (error) => `pr-gate failed: ${error}`;
 
 const short = (sha) => sha.slice(0, 10);
 
@@ -117,7 +128,7 @@ function codexReactionAnswer({ responses, reactions, events, openedAt, draft, he
   const [thumbsUp] = codexReactions(reactions, THUMBS_UP);
   if (thumbsUp === undefined) return null;
   if (headPushedAt === null) {
-    return { pending: `Codex's 👍 is not counted: ${short(head)} has no check suite to date its push` };
+    return { pending: `Codex's thumbs-up is not counted: ${short(head)} has no check suite to date its push` };
   }
 
   const at = timestamp(thumbsUp.created_at, 'Codex reaction');
@@ -133,7 +144,7 @@ function codexReactionAnswer({ responses, reactions, events, openedAt, draft, he
     requests.some((requested) => requested < at && !voids.some((voided) => voided >= requested));
   return tied
     ? { verdict: { clean: true, at, byThumbsUp: true } }
-    : { pending: `Codex's 👍 is not tied to ${short(head)}; comment @codex review` };
+    : { pending: `Codex's thumbs-up is not tied to ${short(head)}; comment @codex review` };
 }
 
 // Codex's out-of-credits answer names no commit, so its age against the push
@@ -193,7 +204,7 @@ function codexStatus({ comments, reviews, reactions, events, openedAt, draft, he
   if (latest !== undefined) {
     if (latest.clean) {
       const found = `Codex found no major issues in ${short(head)}`;
-      return { state: 'success', description: latest.byThumbsUp ? `${found} (👍 on the PR)` : found };
+      return { state: 'success', description: latest.byThumbsUp ? `${found} (thumbs-up on the PR)` : found };
     }
     return {
       state: 'pending',
@@ -249,10 +260,13 @@ const newest = (history, context) => history.find((s) => s.context === context);
 
 async function post({ github, core, owner, repo, pr, history, context, status }) {
   const current = newest(history, context);
+  // Compared, posted and logged as the API will hold it, so an unchanged status
+  // still reads as unchanged next run.
+  const description = postable(status.description);
   // GitHub keeps at most 1000 statuses per commit and context, after which it
   // refuses new ones; a sweep re-posting an unchanged status every run would
   // spend that in days and leave the gate unable to ever report again.
-  if (current && current.state === status.state && current.description === status.description) {
+  if (current && current.state === status.state && current.description === description) {
     core.info(`PR #${pr.number} @ ${short(pr.head.sha)}: ${context} already ${status.state}`);
     return;
   }
@@ -262,10 +276,10 @@ async function post({ github, core, owner, repo, pr, history, context, status })
     sha: pr.head.sha,
     context,
     state: status.state,
-    description: status.description,
+    description,
     target_url: pr.html_url,
   });
-  core.info(`PR #${pr.number} @ ${short(pr.head.sha)}: ${context} -> ${status.state} (${status.description})`);
+  core.info(`PR #${pr.number} @ ${short(pr.head.sha)}: ${context} -> ${status.state} (${description})`);
 }
 
 async function readStatuses({ github, owner, repo, pr }) {
@@ -367,7 +381,7 @@ async function evaluate({ github, core, owner, repo, prNumber }) {
     // gate as "the reviewer is slow". The error state still blocks merge. Both
     // contexts: they are derived together, so after a failure neither is known
     // to be current.
-    const status = { state: 'error', description: `pr-gate failed: ${error}`.slice(0, MAX_STATUS_DESCRIPTION) };
+    const status = { state: 'error', description: crashDescription(error) };
     for (const context of [CODEX_CONTEXT, INTERNAL_CONTEXT]) {
       try {
         await post({ github, core, owner, repo, pr, history, context, status });
@@ -419,4 +433,4 @@ async function run({ github, context, core }) {
   }
 }
 
-module.exports = { codexStatus, internalReviewStatus, run };
+module.exports = { codexStatus, crashDescription, internalReviewStatus, postable, MAX_STATUS_DESCRIPTION, run };

@@ -48,19 +48,41 @@ const T2 = '2026-01-01T00:10:00Z';
 const T3 = '2026-01-01T00:15:00Z';
 const T4 = '2026-01-01T00:20:00Z';
 
+// The API's rule, stated here rather than asked of the code that implements it:
+// a description carries no character outside the BMP ("Description doesn't
+// accept 4-byte Unicode") and is no longer than the bound.
+const assertPostable = (description, what) => {
+  assert.deepEqual(
+    [...description].filter((c) => c.codePointAt(0) > 0xffff),
+    [],
+    `${what} is outside the BMP: ${description}`,
+  );
+  assert.ok(description.length <= gate.MAX_STATUS_DESCRIPTION, `${what} is over the bound: ${description}`);
+};
+
+// `post` repairs any description the API would reject, so nothing the gate says
+// can block a PR. These are the gate's own words, though, and a reader should
+// never be shown a repair: what a builder returns is already postable.
+const wellWorded = (status) => {
+  assertPostable(status.description, 'the wording');
+  return status;
+};
+
 const codex = (given) =>
-  gate.codexStatus({
-    comments: [],
-    reviews: [],
-    reactions: [],
-    events: [],
-    openedAt: BEFORE,
-    draft: false,
-    head: HEAD,
-    headPushedAt: Date.parse(T0),
-    ...given,
-  });
-const internal = (comments) => gate.internalReviewStatus({ comments, head: HEAD });
+  wellWorded(
+    gate.codexStatus({
+      comments: [],
+      reviews: [],
+      reactions: [],
+      events: [],
+      openedAt: BEFORE,
+      draft: false,
+      head: HEAD,
+      headPushedAt: Date.parse(T0),
+      ...given,
+    }),
+  );
+const internal = (comments) => wellWorded(gate.internalReviewStatus({ comments, head: HEAD }));
 
 // ------------------------------------------------------- codex-review: verdicts
 
@@ -262,11 +284,11 @@ test('waiver: whitespace around the message is not part of it', () => {
 
 // ------------------------------------------------------ codex-review: Codex's 👍
 
-const NOT_TIED = `Codex's 👍 is not tied to ${HEAD10}; comment @codex review`;
-const TIED = `Codex found no major issues in ${HEAD10} (👍 on the PR)`;
+const NOT_TIED = `Codex's thumbs-up is not tied to ${HEAD10}; comment @codex review`;
+const TIED = `Codex found no major issues in ${HEAD10} (thumbs-up on the PR)`;
 const REVIEWING = `Codex is reviewing; waiting for its verdict on ${HEAD10}`;
 const RESPONDED = `Codex responded, but no verdict names ${HEAD10}`;
-const UNDATED = `Codex's 👍 is not counted: ${HEAD10} has no check suite to date its push`;
+const UNDATED = `Codex's thumbs-up is not counted: ${HEAD10} has no check suite to date its push`;
 // After the PR's first ready request at BEFORE, before the head's push at T0.
 const EARLIER = '2025-12-31T23:30:00Z';
 
@@ -585,6 +607,8 @@ function fakeGithub({
       // newest first, as the API returns them
       listCommitStatusesForRef: async () => ({ data: statuses }),
       createCommitStatus: async (s) => {
+        // Nothing the API would reject reaches it, the crash description included.
+        assertPostable(s.description, 'the posted description');
         posted.push(s);
         return { data: {} };
       },
@@ -753,7 +777,7 @@ test('run: the gate\'s own earlier statuses never date the head', async () => {
   // A first `pending`, or a crash's `error`, posted after Codex's answer.
   for (const statuses of [
     [status('codex-review', 'pending', `Waiting for a Codex review of ${HEAD10}`, T2)],
-    [status('codex-review', 'error', 'pr-gate failed: x', T3), status('codex-review', 'success', WAIVED_DESCRIPTION, T2)],
+    [status('codex-review', 'error', gate.crashDescription(new Error('x')), T3), status('codex-review', 'success', WAIVED_DESCRIPTION, T2)],
   ]) {
     const { github, posted } = fakeGithub({ prs: [openPr()], commentsByCall: [[comment(CODEX, LIMIT, T1)]], statuses });
     await gate.run({ github, context: commentEvent, core: fakeCore().core });
@@ -813,8 +837,28 @@ test('run: a crash is surfaced on the PR as an error status for both contexts, t
   };
   await assert.rejects(gate.run({ github, context: pushEvent, core: fakeCore().core }), /xxx/);
   assert.deepEqual(posted.map((s) => [s.context, s.state]).sort(), [['codex-review', 'error'], ['internal-review', 'error']]);
-  // GitHub rejects descriptions over 140 characters.
-  assert.ok(posted.every((s) => s.description.length <= 140 && s.sha === HEAD));
+  assert.ok(posted.every((s) => s.sha === HEAD && s.description.length <= gate.MAX_STATUS_DESCRIPTION));
+});
+
+test('postable: the bound is the one the status API documents', () => {
+  assert.equal(gate.MAX_STATUS_DESCRIPTION, 140);
+});
+
+test('postable: a character outside the BMP is replaced, and what is left is cut to the bound', () => {
+  assert.equal(gate.postable('✅a👀b👍c𠀀d'), '✅a?b?c?d');
+  assert.equal(gate.postable('x'.repeat(200)), 'x'.repeat(gate.MAX_STATUS_DESCRIPTION));
+  // Straddling the cut: repaired first, there is no pair left for the cut to split.
+  const upToTheCut = 'x'.repeat(gate.MAX_STATUS_DESCRIPTION - 1);
+  assert.equal(gate.postable(`${upToTheCut}👀 and more`), `${upToTheCut}?`);
+});
+
+test('run: a crash message carrying an emoji still posts', async () => {
+  const { github, posted } = fakeGithub({ prs: [openPr()], commentsByCall: [[]] });
+  github.rest.pulls.listReviews = async () => {
+    throw new Error('reviews API down 👀');
+  };
+  await assert.rejects(gate.run({ github, context: pushEvent, core: fakeCore().core }), /reviews API down/);
+  assert.equal(posted.length, 2);
 });
 
 test('run: a crash demotes an existing success on both contexts', async () => {
@@ -861,7 +905,7 @@ test('run: when only the second status fails to post, neither context is left lo
 });
 
 test('run: a crash that repeats does not re-post an identical error status', async () => {
-  const description = 'pr-gate failed: Error: reviews API down';
+  const description = gate.crashDescription(new Error('reviews API down'));
   const { github, posted } = fakeGithub({
     prs: [openPr()],
     commentsByCall: [[]],
@@ -869,6 +913,25 @@ test('run: a crash that repeats does not re-post an identical error status', asy
   });
   github.rest.pulls.listReviews = async () => {
     throw new Error('reviews API down');
+  };
+  await assert.rejects(gate.run({ github, context: commentEvent, core: fakeCore().core }), /reviews API down/);
+  assert.deepEqual(posted, []);
+});
+
+test('run: a repeated crash whose message had to be repaired is still recognized as unchanged', async () => {
+  // GitHub holds the repaired description, so that is what the next run has to
+  // compare against; against the raw message it would re-post every run and
+  // spend the commit's status budget. The '?' is what postable leaves where the
+  // 👀 thrown below was; it is spelled out because an expectation built by
+  // calling postable would grade nothing.
+  const description = gate.crashDescription(new Error('reviews API down ?'));
+  const { github, posted } = fakeGithub({
+    prs: [openPr()],
+    commentsByCall: [[]],
+    statuses: [status('codex-review', 'error', description, T2), status('internal-review', 'error', description, T2)],
+  });
+  github.rest.pulls.listReviews = async () => {
+    throw new Error('reviews API down 👀');
   };
   await assert.rejects(gate.run({ github, context: commentEvent, core: fakeCore().core }), /reviews API down/);
   assert.deepEqual(posted, []);

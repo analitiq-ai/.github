@@ -233,8 +233,10 @@ re-readies with no push in between. Once the head moves after the PR was first
 ready, only `@codex review` gets a verdict: Codex answers it with one naming
 the commit.
 
-A counted 👍 reads `Codex found no major issues in <sha> (👍 on the PR)`, so it
-is never mistaken for a verdict naming the commit.
+A counted 👍 reads `Codex found no major issues in <sha> (thumbs-up on the
+PR)`, so it is never mistaken for a verdict naming the commit. A status
+description spells the reaction out because the API rejects a description
+carrying a character outside the BMP, which is what the reaction is.
 
 A reaction triggers no workflow, so nothing re-runs the gate when the 👍
 arrives; the next event or scheduled sweep would. To have it counted now, send
@@ -254,8 +256,8 @@ description that applies:
 | When | Description |
 |---|---|
 | Codex shows 👀 | `Codex is reviewing; waiting for its verdict on <sha>` |
-| a Codex 👍, but the push cannot be dated | `Codex's 👍 is not counted: <sha> has no check suite to date its push` |
-| any other Codex 👍 | `Codex's 👍 is not tied to <sha>; comment @codex review` |
+| a Codex 👍, but the push cannot be dated | `Codex's thumbs-up is not counted: <sha> has no check suite to date its push` |
+| any other Codex 👍 | `Codex's thumbs-up is not tied to <sha>; comment @codex review` |
 | an out-of-credits answer, but the push cannot be dated | `Codex is out of credits; <sha> has no check suite to date its push, so it is not waived` |
 | an out-of-credits answer older than the push | `Codex's out-of-credits answer predates <sha>; comment @codex review` |
 | any other answer from Codex | `No clean Codex verdict for <sha> yet` |
