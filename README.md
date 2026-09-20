@@ -235,7 +235,8 @@ the commit.
 
 A counted 👍 reads `Codex found no major issues in <sha> (thumbs-up on the
 PR)`, so it is never mistaken for a verdict naming the commit. A status
-description spells the reaction out: the API rejects one carrying an emoji.
+description spells the reaction out because the API rejects a description
+carrying a character outside the BMP, which is what the reaction is.
 
 A reaction triggers no workflow, so nothing re-runs the gate when the 👍
 arrives; the next event or scheduled sweep would. To have it counted now, send
