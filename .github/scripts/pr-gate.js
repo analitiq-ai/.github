@@ -57,8 +57,9 @@ const MAX_STATUS_DESCRIPTION = 140;
 // it to split.
 const postable = (description) => description.replace(/[^\u{0}-\u{FFFF}]/gu, '?').slice(0, MAX_STATUS_DESCRIPTION);
 
-// The one description the gate does not word. Named so a test can build what a
-// crash posts instead of keeping its own copy of this text.
+// The gate's wording around an error it did not write. Named so a test builds the
+// crash text from here instead of keeping its own copy; what a crash posts is
+// this, repaired by postable.
 const crashDescription = (error) => `pr-gate failed: ${error}`;
 
 const short = (sha) => sha.slice(0, 10);
