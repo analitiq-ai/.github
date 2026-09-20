@@ -847,6 +847,9 @@ test('postable: the bound is the one the status API documents', () => {
 test('postable: a character outside the BMP is replaced, and what is left is cut to the bound', () => {
   assert.equal(gate.postable('✅a👀b👍c𠀀d'), '✅a?b?c?d');
   assert.equal(gate.postable('x'.repeat(200)), 'x'.repeat(gate.MAX_STATUS_DESCRIPTION));
+  // Straddling the cut: repaired first, there is no pair left for the cut to split.
+  const upToTheCut = 'x'.repeat(gate.MAX_STATUS_DESCRIPTION - 1);
+  assert.equal(gate.postable(`${upToTheCut}👀 and more`), `${upToTheCut}?`);
 });
 
 test('run: a crash message carrying an emoji still posts', async () => {
@@ -856,26 +859,6 @@ test('run: a crash message carrying an emoji still posts', async () => {
   };
   await assert.rejects(gate.run({ github, context: pushEvent, core: fakeCore().core }), /reviews API down/);
   assert.equal(posted.length, 2);
-});
-
-test('run: an emoji straddling the cut of a long crash message leaves no half behind', async () => {
-  const { github, posted } = fakeGithub({ prs: [openPr()], commentsByCall: [[]] });
-  // Where the thrown message begins in the description, so a reworded prefix moves
-  // the emoji with it instead of leaving this test grading nothing.
-  const message = 'm'.repeat(200);
-  const messageStarts = gate.crashDescription(new Error(message)).indexOf(message);
-  const filler = 'x'.repeat(gate.MAX_STATUS_DESCRIPTION - messageStarts - 1);
-  github.rest.pulls.listReviews = async () => {
-    throw new Error(`${filler}👀${'y'.repeat(50)}`);
-  };
-  await assert.rejects(gate.run({ github, context: pushEvent, core: fakeCore().core }), /xxx/);
-  assert.equal(posted.length, 2);
-  assert.ok(posted.every((s) => !/[\uD800-\uDFFF]/.test(s.description)), 'a lone surrogate reached the API');
-  // The emoji did land on the cut: it is the last character kept, repaired.
-  assert.ok(
-    posted.every((s) => s.description.length === gate.MAX_STATUS_DESCRIPTION && s.description.endsWith('?')),
-    'the emoji did not straddle the cut, so nothing was graded',
-  );
 });
 
 test('run: a crash demotes an existing success on both contexts', async () => {
