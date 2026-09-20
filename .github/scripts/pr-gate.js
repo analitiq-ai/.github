@@ -51,11 +51,15 @@ const ATTESTED_COMMIT = /\*{0,2}Reviewed commit:\*{0,2}\s*[`'"]?([0-9a-f]{10,40}
 const MAX_STATUS_DESCRIPTION = 140;
 // GitHub rejects a longer status description, and one carrying a character
 // outside the BMP ("Description doesn't accept 4-byte Unicode") — which is what
-// a reaction emoji is. The gate words its own descriptions to fit; an error's
+// 👍 and 👀 are. The gate words its own descriptions to fit; an error's
 // message is not its to word, so every description is repaired here, at the one
 // boundary they all cross. Repairing before the cut leaves no surrogate pair for
 // it to split.
 const postable = (description) => description.replace(/[^\u{0}-\u{FFFF}]/gu, '?').slice(0, MAX_STATUS_DESCRIPTION);
+
+// The one description the gate does not word. Named so a test can build what a
+// crash posts instead of keeping its own copy of this text.
+const crashDescription = (error) => `pr-gate failed: ${error}`;
 
 const short = (sha) => sha.slice(0, 10);
 
@@ -376,7 +380,7 @@ async function evaluate({ github, core, owner, repo, prNumber }) {
     // gate as "the reviewer is slow". The error state still blocks merge. Both
     // contexts: they are derived together, so after a failure neither is known
     // to be current.
-    const status = { state: 'error', description: `pr-gate failed: ${error}` };
+    const status = { state: 'error', description: crashDescription(error) };
     for (const context of [CODEX_CONTEXT, INTERNAL_CONTEXT]) {
       try {
         await post({ github, core, owner, repo, pr, history, context, status });
@@ -428,4 +432,4 @@ async function run({ github, context, core }) {
   }
 }
 
-module.exports = { codexStatus, internalReviewStatus, postable, MAX_STATUS_DESCRIPTION, run };
+module.exports = { codexStatus, crashDescription, internalReviewStatus, postable, MAX_STATUS_DESCRIPTION, run };

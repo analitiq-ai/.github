@@ -48,12 +48,23 @@ const T2 = '2026-01-01T00:10:00Z';
 const T3 = '2026-01-01T00:15:00Z';
 const T4 = '2026-01-01T00:20:00Z';
 
+// The API's rule, stated here rather than asked of the code that implements it:
+// a description carries no character outside the BMP ("Description doesn't
+// accept 4-byte Unicode") and is no longer than the bound.
+const assertPostable = (description, what) => {
+  assert.deepEqual(
+    [...description].filter((c) => c.codePointAt(0) > 0xffff),
+    [],
+    `${what} is outside the BMP: ${description}`,
+  );
+  assert.ok(description.length <= gate.MAX_STATUS_DESCRIPTION, `${what} is over the bound: ${description}`);
+};
+
 // `post` repairs any description the API would reject, so nothing the gate says
 // can block a PR. These are the gate's own words, though, and a reader should
-// never be shown a repair: every status a builder returns has to survive the
-// rule unchanged.
+// never be shown a repair: what a builder returns is already postable.
 const wellWorded = (status) => {
-  assert.equal(gate.postable(status.description), status.description, `repaired on the way out: ${status.description}`);
+  assertPostable(status.description, 'the wording');
   return status;
 };
 
@@ -596,8 +607,8 @@ function fakeGithub({
       // newest first, as the API returns them
       listCommitStatusesForRef: async () => ({ data: statuses }),
       createCommitStatus: async (s) => {
-        // Nothing reaches the API unrepaired, the crash description included.
-        assert.equal(gate.postable(s.description), s.description, `not postable: ${s.description}`);
+        // Nothing the API would reject reaches it, the crash description included.
+        assertPostable(s.description, 'the posted description');
         posted.push(s);
         return { data: {} };
       },
@@ -766,7 +777,7 @@ test('run: the gate\'s own earlier statuses never date the head', async () => {
   // A first `pending`, or a crash's `error`, posted after Codex's answer.
   for (const statuses of [
     [status('codex-review', 'pending', `Waiting for a Codex review of ${HEAD10}`, T2)],
-    [status('codex-review', 'error', 'pr-gate failed: x', T3), status('codex-review', 'success', WAIVED_DESCRIPTION, T2)],
+    [status('codex-review', 'error', gate.crashDescription('x'), T3), status('codex-review', 'success', WAIVED_DESCRIPTION, T2)],
   ]) {
     const { github, posted } = fakeGithub({ prs: [openPr()], commentsByCall: [[comment(CODEX, LIMIT, T1)]], statuses });
     await gate.run({ github, context: commentEvent, core: fakeCore().core });
@@ -829,6 +840,15 @@ test('run: a crash is surfaced on the PR as an error status for both contexts, t
   assert.ok(posted.every((s) => s.sha === HEAD && s.description.length <= gate.MAX_STATUS_DESCRIPTION));
 });
 
+test('postable: the bound is the one the status API documents', () => {
+  assert.equal(gate.MAX_STATUS_DESCRIPTION, 140);
+});
+
+test('postable: a character outside the BMP is replaced, and what is left is cut to the bound', () => {
+  assert.equal(gate.postable('a👀b'), 'a?b');
+  assert.equal(gate.postable('x'.repeat(200)), 'x'.repeat(gate.MAX_STATUS_DESCRIPTION));
+});
+
 test('run: a crash message carrying an emoji still posts', async () => {
   const { github, posted } = fakeGithub({ prs: [openPr()], commentsByCall: [[]] });
   github.rest.pulls.listReviews = async () => {
@@ -840,14 +860,22 @@ test('run: a crash message carrying an emoji still posts', async () => {
 
 test('run: an emoji straddling the cut of a long crash message leaves no half behind', async () => {
   const { github, posted } = fakeGithub({ prs: [openPr()], commentsByCall: [[]] });
-  // The emoji's first half on the last character the cut keeps.
-  const filler = 'x'.repeat(gate.MAX_STATUS_DESCRIPTION - 'pr-gate failed: Error: '.length - 1);
+  // Where the gate's own wording ends, so a reworded prefix moves the emoji
+  // with it instead of leaving this test grading nothing.
+  const message = 'm'.repeat(200);
+  const written = gate.crashDescription(new Error(message)).indexOf(message);
+  const filler = 'x'.repeat(gate.MAX_STATUS_DESCRIPTION - written - 1);
   github.rest.pulls.listReviews = async () => {
     throw new Error(`${filler}👀${'y'.repeat(50)}`);
   };
   await assert.rejects(gate.run({ github, context: pushEvent, core: fakeCore().core }), /xxx/);
   assert.equal(posted.length, 2);
   assert.ok(posted.every((s) => !/[\uD800-\uDFFF]/.test(s.description)), 'a lone surrogate reached the API');
+  // The emoji did land on the cut: it is the last character kept, repaired.
+  assert.ok(
+    posted.every((s) => s.description.length === gate.MAX_STATUS_DESCRIPTION && s.description.endsWith('?')),
+    'the emoji did not straddle the cut, so nothing was graded',
+  );
 });
 
 test('run: a crash demotes an existing success on both contexts', async () => {
@@ -894,7 +922,7 @@ test('run: when only the second status fails to post, neither context is left lo
 });
 
 test('run: a crash that repeats does not re-post an identical error status', async () => {
-  const description = 'pr-gate failed: Error: reviews API down';
+  const description = gate.crashDescription(new Error('reviews API down'));
   const { github, posted } = fakeGithub({
     prs: [openPr()],
     commentsByCall: [[]],
@@ -911,7 +939,7 @@ test('run: a repeated crash whose message had to be repaired is still recognized
   // GitHub holds the repaired description, so that is what the next run has to
   // compare against; against the raw message it would re-post every run and
   // spend the commit's status budget.
-  const description = gate.postable('pr-gate failed: Error: reviews API down 👀');
+  const description = gate.crashDescription(new Error('reviews API down ?'));
   const { github, posted } = fakeGithub({
     prs: [openPr()],
     commentsByCall: [[]],
