@@ -260,10 +260,11 @@ function internalReviewStatus({ comments, head }) {
 
 // Exactly x.y.z, so neither a float constant (0.5) nor an IP address
 // (10.1.2.3) is a version, plus an optional pre-release suffix: a label PEP 440
-// and semver both rank before the release, then its number (rc26, -beta1). Any
-// other suffix (post1, beta) leaves no version token, so the line is not a
-// version change. Whole tokens only: neither `a1.0.0` nor `1.0.0rc25.tar`
-// holds a version. The capture makes split() interleave text and versions,
+// and semver both rank before the release, then its number (rc26, -beta1).
+// Another suffix glued on (post1, beta) leaves no version token; after a hyphen
+// (-post1, -beta) the token is the bare x.y.z and the suffix stays text, so the
+// manifest's own version (1.0.0-post1) never equals it. Whole tokens only:
+// neither `a1.0.0` nor `1.0.0rc25.tar` holds a version. The capture makes split() interleave text and versions,
 // versions at the odd indices.
 const VERSION = String.raw`\d+\.\d+\.\d+(?:-?(?:alpha|a|beta|b|rc|dev)\d+)?`;
 const VERSION_TOKEN = new RegExp(String.raw`(?<![\w.])(${VERSION})(?![\w.])`);
@@ -366,9 +367,9 @@ const OWN_VERSION_READERS = {
     }
     return typeof manifest?.version === 'string' ? manifest.version : null;
   },
-  // Only [project] (PEP 621) and [tool.poetry] declare the package; a header
-  // written any other way ([[array]], quoted keys) ends the search, which
-  // fails closed.
+  // Only [project] (PEP 621) and [tool.poetry] declare the package. A header
+  // this does not parse ([[array]], quoted keys) leaves only the lines under it
+  // unread; a later [project] or [tool.poetry] is still read.
   'pyproject.toml': (text) => {
     let table = null;
     for (const line of text.split('\n')) {
@@ -389,8 +390,8 @@ const ownVersionReader = (filename) => OWN_VERSION_READERS[filename.split('/').p
 // reviewed when it merged. Returns that bump, or null.
 // read(side, path): a changed file's text at 'base' (the merge base) or 'head',
 // or null when it cannot be read as text.
-// Called only for manifests in a diff that already passed as one version
-// change, so the reads a normal PR costs are none.
+// read is called only for manifests, and only once the diff passed as one
+// version change; the comparison that produced `files` is the caller's.
 async function versionOnlyRelease({ files, read }) {
   const change = soleVersionChange(files);
   if (change === null || !isGreater(change.to, change.from)) return null;

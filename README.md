@@ -169,8 +169,8 @@ hold:
 - every file is modified, and GitHub returns its text patch (nothing added,
   removed or renamed, no binary or oversized file, no truncated comparison;
   a PR changing more than 300 files is never compared);
-- every changed line is replaced in place by a line that differs only in one
-  whole version token, and the same `OLD → NEW` pair holds across the PR. A
+- every changed line is replaced in place by a line that differs only in
+  whole version tokens, each moved `OLD → NEW`, the same pair across the PR. A
   version token is `x.y.z`, optionally followed by a pre-release suffix
   `a`/`alpha`/`b`/`beta`/`rc`/`dev` plus a number (`rc26`, `-beta1`);
 - a changed `pyproject.toml` declares `OLD` at the merge base and `NEW` at the

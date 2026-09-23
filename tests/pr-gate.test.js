@@ -1097,6 +1097,13 @@ test('versionOnlyRelease: a version line in a Poetry dependency sub-table is not
   assert.equal(await release(files, { 'pyproject.toml': { base: poetry('2.31.0'), head: poetry('2.32.0') } }), null);
 });
 
+test('versionOnlyRelease: a dependency pinned at the own version and moved alone is not a release', async () => {
+  const poetry = (dep) =>
+    `[tool.poetry]\nname = "x"\nversion = "2.31.0"\n\n[tool.poetry.dependencies.requests]\nversion = "${dep}"\n`;
+  const files = [declared('2.31.0', '2.32.0')];
+  assert.equal(await release(files, { 'pyproject.toml': { base: poetry('2.31.0'), head: poetry('2.32.0') } }), null);
+});
+
 test('versionOnlyRelease: a nested "version" key in a package.json is not the own version', async () => {
   const pkg = (dep) => JSON.stringify({ name: 'web', version: '9.0.0', dependencies: { x: { version: dep } } }, null, 2);
   const file = modified('package.json', '@@ -6 +6 @@\n-        "version": "1.2.3"\n+        "version": "1.2.4"\n');
