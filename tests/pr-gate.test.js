@@ -7,6 +7,8 @@ const gate = require('../.github/scripts/pr-gate.js');
 
 const HEAD = '99ed81fce1f091223f9fcbac24070ea192da1622';
 const OTHER = '128ed7ba3cf9387775318f9982b6b816193d4f47';
+const BASE = 'bd8be443d5691dcc8043ea031f94a5d9be622913';
+const MERGE_BASE = '6db5457aa1b2c3d4e5f60718293a4b5c6d7e8f90';
 const HEAD10 = HEAD.slice(0, 10);
 const CODEX = 'chatgpt-codex-connector[bot]';
 const BOT = 'Analitiq-Bot';
@@ -580,9 +582,14 @@ function fakeGithub({
   events = [],
   statuses = [],
   suites = [suite(T0)],
+  files = [],
+  manifests = {},
+  compareFails = null,
   failFor = [],
 }) {
   const posted = [];
+  const compared = [];
+  const read = [];
   let reads = 0;
   const rest = {
     pulls: {
@@ -604,6 +611,17 @@ function fakeGithub({
       listSuitesForRef: async () => ({ data: { total_count: suites.length, check_suites: suites } }),
     },
     repos: {
+      compareCommitsWithBasehead: async ({ basehead }) => {
+        compared.push(basehead);
+        if (compareFails) throw compareFails;
+        return { data: { files, merge_base_commit: { sha: MERGE_BASE } } };
+      },
+      getContent: async ({ path, ref }) => {
+        read.push(`${path}@${ref}`);
+        const text = manifests[path]?.[ref];
+        if (text === undefined) throw apiError(404);
+        return { data: { type: 'file', encoding: 'base64', content: Buffer.from(text).toString('base64') } };
+      },
       // newest first, as the API returns them
       listCommitStatusesForRef: async () => ({ data: statuses }),
       createCommitStatus: async (s) => {
@@ -618,15 +636,19 @@ function fakeGithub({
     const { data } = await fn(params);
     return Array.isArray(data) ? data : data.check_suites;
   };
-  return { posted, github: { rest, paginate } };
+  return { posted, compared, read, github: { rest, paginate } };
 }
 
+// What Octokit throws for a failed request: an error carrying the HTTP status.
+const apiError = (status) => Object.assign(new Error(`HTTP ${status}`), { status });
+
 const fakeCore = () => {
-  const log = { failed: [], errors: [], notices: [] };
+  const log = { failed: [], errors: [], notices: [], warnings: [] };
   return {
     log,
     core: {
       info() {},
+      warning: (m) => log.warnings.push(m),
       notice: (m) => log.notices.push(m),
       error: (m) => log.errors.push(m),
       setFailed: (m) => log.failed.push(m),
@@ -638,6 +660,8 @@ const openPr = (number = 7) => ({
   number,
   state: 'open',
   head: { sha: HEAD },
+  base: { sha: BASE },
+  changed_files: 0,
   html_url: `https://example.test/pr/${number}`,
   created_at: BEFORE,
   updated_at: T3,
@@ -959,4 +983,268 @@ test('run: the sweep evaluates every open PR and one failure does not starve the
   assert.match(log.failed[0], /#7/);
   assert.equal(log.errors.length, 1);
   assert.match(log.errors[0], /pr-gate\.test\.js/, 'the stack, not just the message');
+});
+
+// The shape of a real release PR: the package's own version moved up, and a
+// pin of it moved with it.
+const modified = (filename, patch) => ({ filename, status: 'modified', patch });
+const PYPROJECT = (version) =>
+  `[build-system]\nrequires = ["setuptools"]\n\n[project]\nname = "validator"\nversion = "${version}"\n` +
+  `dependencies = [\n    "contract-models==${version}",\n]\n`;
+const RELEASE_FILES = [
+  modified(
+    'packages/validator/pyproject.toml',
+    '@@ -5,7 +5,7 @@ requires = ["setuptools"]\n name = "validator"\n-version = "1.0.0rc25"\n+version = "1.0.0rc26"\n dependencies = [\n' +
+      '-    "contract-models==1.0.0rc25",\n+    "contract-models==1.0.0rc26",\n ]\n',
+  ),
+  modified(
+    'agents/validator.md',
+    "@@ -46,8 +46,8 @@ on first use\n-{ check '1.0.0rc25' \\\n-  || pip install \"validator==1.0.0rc25\"; } \\\n+{ check '1.0.0rc26' \\\n+  || pip install \"validator==1.0.0rc26\"; } \\\n && run\n",
+  ),
+];
+const RELEASE_MANIFESTS = {
+  'packages/validator/pyproject.toml': { base: PYPROJECT('1.0.0rc25'), head: PYPROJECT('1.0.0rc26') },
+};
+const RELEASE = { from: '1.0.0rc25', to: '1.0.0rc26' };
+
+// versionOnlyRelease reads a manifest through `read(side, path)`; this one
+// serves `manifests[path][side]` and fails like a missing file otherwise.
+const release = (files, manifests = RELEASE_MANIFESTS) =>
+  gate.versionOnlyRelease({
+    files,
+    read: async (side, path) => {
+      const text = manifests[path]?.[side];
+      if (text === undefined) throw apiError(404);
+      return text;
+    },
+  });
+// The release plus one more file, which uses the release's own pair so that
+// only the rule a case names can reject it.
+const releaseWith = (patch, filename = 'extra.py') => [...RELEASE_FILES, modified(filename, patch)];
+// A PR that moves nothing but the version line of a pyproject.toml.
+const declared = (from, to, filename = 'pyproject.toml') =>
+  modified(filename, `@@ -1 +1 @@\n-version = "${from}"\n+version = "${to}"\n`);
+const bump = (from, to) =>
+  release([declared(from, to)], { 'pyproject.toml': { base: PYPROJECT(from), head: PYPROJECT(to) } });
+
+test('versionOnlyRelease: the own version moved up, with a pin of it, qualifies', async () => {
+  assert.deepEqual(await release(RELEASE_FILES), RELEASE);
+});
+
+test('versionOnlyRelease: a line that keeps an unchanged version beside the bumped one still qualifies', async () => {
+  assert.deepEqual(await release(releaseWith('@@ -1 +1 @@\n-a = "2.0.0" b = "1.0.0rc25"\n+a = "2.0.0" b = "1.0.0rc26"\n')), RELEASE);
+});
+
+test('versionOnlyRelease: the version of a [tool.poetry] package is its own version', async () => {
+  const poetry = (v) => `[tool.poetry]\nname = "analitiq-cdk"\nversion = "${v}"\n`;
+  const files = [declared('0.3.0', '0.4.0', 'cdk/pyproject.toml')];
+  assert.deepEqual(await release(files, { 'cdk/pyproject.toml': { base: poetry('0.3.0'), head: poetry('0.4.0') } }), {
+    from: '0.3.0',
+    to: '0.4.0',
+  });
+});
+
+test('versionOnlyRelease: the top-level version of a package.json is its own version', async () => {
+  const pkg = (v) => JSON.stringify({ name: 'web', version: v }, null, 2);
+  const file = modified('web/package.json', '@@ -3 +3 @@\n-  "version": "1.2.3"\n+  "version": "1.2.4"\n');
+  assert.deepEqual(await release([file], { 'web/package.json': { base: pkg('1.2.3'), head: pkg('1.2.4') } }), {
+    from: '1.2.3',
+    to: '1.2.4',
+  });
+});
+
+test('versionOnlyRelease: a PR with no files does not qualify', async () => {
+  assert.equal(await release([]), null);
+});
+
+for (const status of ['added', 'removed', 'renamed', 'copied', 'changed']) {
+  test(`versionOnlyRelease: a ${status} file disqualifies`, async () => {
+    assert.equal(await release([...RELEASE_FILES, { ...RELEASE_FILES[1], filename: 'x', status }]), null);
+  });
+}
+
+test('versionOnlyRelease: a file without a text patch (binary or too large) disqualifies', async () => {
+  assert.equal(await release([...RELEASE_FILES, { filename: 'x.bin', status: 'modified' }]), null);
+});
+
+const DISQUALIFYING_EXTRA = {
+  'an added line with no removed partner': '@@ -1,1 +1,2 @@\n-v = "1.0.0rc25"\n+v = "1.0.0rc26"\n+evil()\n',
+  'a removed line with no added partner': '@@ -1,2 +1,1 @@\n-v = "1.0.0rc25"\n-guard()\n+v = "1.0.0rc26"\n',
+  'a removed line paired with an added line across context': '@@ -1,3 +1,3 @@\n-v = "1.0.0rc25"\n guard()\n+v = "1.0.0rc26"\n',
+  'an edit beside the version': '@@ -1 +1 @@\n-v = "1.0.0rc25"  # a\n+v = "1.0.0rc26"  # b\n',
+  'a line changed without any version': '@@ -1 +1 @@\n-x = 1\n+x = 2\n',
+  'a second version pair': '@@ -1 +1 @@\n-dep==2.0.0\n+dep==2.0.1\n',
+  'the version glued to a leading word character': '@@ -1 +1 @@\n-v = "a1.0.0rc25"\n+v = "a1.0.0rc26"\n',
+  'the version glued to a trailing extension': '@@ -1 +1 @@\n-v = "1.0.0rc25.tar"\n+v = "1.0.0rc26.tar"\n',
+  'a no-newline marker': '@@ -1 +1 @@\n-v = "1.0.0rc25"\n\\ No newline at end of file\n+v = "1.0.0rc26"\n\\ No newline at end of file\n',
+};
+for (const [what, patch] of Object.entries(DISQUALIFYING_EXTRA)) {
+  test(`versionOnlyRelease: ${what} disqualifies`, async () => {
+    assert.equal(await release(releaseWith(patch)), null);
+  });
+}
+
+test('versionOnlyRelease: pins moved without the own version do not qualify', async () => {
+  assert.equal(await release([RELEASE_FILES[1]]), null);
+  const dependency = modified('pyproject.toml', '@@ -1 +1 @@\n-    "requests==2.31.0",\n+    "requests==2.32.0",\n');
+  assert.equal(await release([dependency], { 'pyproject.toml': { base: PYPROJECT('1.0.0'), head: PYPROJECT('1.0.0') } }), null);
+});
+
+test('versionOnlyRelease: a version line in a Poetry dependency sub-table is not the own version', async () => {
+  const poetry = (dep) =>
+    `[tool.poetry]\nname = "x"\nversion = "1.0.0"\n\n[tool.poetry.dependencies.requests]\nversion = "${dep}"\n`;
+  const files = [declared('2.31.0', '2.32.0')];
+  assert.equal(await release(files, { 'pyproject.toml': { base: poetry('2.31.0'), head: poetry('2.32.0') } }), null);
+});
+
+test('versionOnlyRelease: a dependency pinned at the own version and moved alone is not a release', async () => {
+  const poetry = (dep) =>
+    `[tool.poetry]\nname = "x"\nversion = "2.31.0"\n\n[tool.poetry.dependencies.requests]\nversion = "${dep}"\n`;
+  const files = [declared('2.31.0', '2.32.0')];
+  assert.equal(await release(files, { 'pyproject.toml': { base: poetry('2.31.0'), head: poetry('2.32.0') } }), null);
+});
+
+test('versionOnlyRelease: a nested "version" key in a package.json is not the own version', async () => {
+  const pkg = (dep) => JSON.stringify({ name: 'web', version: '9.0.0', dependencies: { x: { version: dep } } }, null, 2);
+  const file = modified('package.json', '@@ -6 +6 @@\n-        "version": "1.2.3"\n+        "version": "1.2.4"\n');
+  assert.equal(await release([file], { 'package.json': { base: pkg('1.2.3'), head: pkg('1.2.4') } }), null);
+});
+
+test('versionOnlyRelease: a package.json that does not parse holds no own version', async () => {
+  const file = modified('package.json', '@@ -3 +3 @@\n-  "version": "1.2.3"\n+  "version": "1.2.4"\n');
+  const broken = (v) => `{ "version": "${v}", }`;
+  assert.equal(await release([file], { 'package.json': { base: broken('1.2.3'), head: broken('1.2.4') } }), null);
+});
+
+test('versionOnlyRelease: a version line outside pyproject.toml or package.json is not the own version', async () => {
+  assert.equal(await release([declared('1.0.0', '1.0.1', 'scripts/pins.py')]), null);
+});
+
+test('versionOnlyRelease: a version with a fourth dotted part is not a version', async () => {
+  assert.equal(await bump('1.0.0.1', '1.0.0.2'), null);
+});
+
+test('versionOnlyRelease: a line replaced by itself is not a bump', async () => {
+  assert.equal(await bump('1.0.0', '1.0.0'), null);
+});
+
+test('versionOnlyRelease: only a move to a greater version qualifies', async () => {
+  for (const [from, to] of [
+    ['1.0.0rc25', '1.0.0rc26'],
+    ['1.0.0rc26', '1.0.0'],
+    ['1.9.0', '1.10.0'],
+    ['1.0.9', '1.1.0'],
+    ['1.2.3-beta1', '1.2.3-beta2'],
+    ['1.0.0dev1', '1.0.0'],
+  ]) {
+    assert.deepEqual(await bump(from, to), { from, to }, `${from} -> ${to}`);
+  }
+  for (const [from, to] of [
+    ['1.0.1', '1.0.0'],
+    ['1.0.0rc26', '1.0.0rc25'],
+    ['1.0.0', '1.0.0rc26'],
+    ['1.10.0', '1.9.0'],
+  ]) {
+    assert.equal(await bump(from, to), null, `${from} -> ${to}`);
+  }
+});
+
+test('versionOnlyRelease: pre-releases with different labels are not comparable', async () => {
+  assert.equal(await bump('1.0.0a1', '1.0.0rc1'), null);
+});
+
+test('versionOnlyRelease: a suffix that is not a pre-release label is not part of a version', async () => {
+  assert.equal(await bump('1.0.0post1', '1.0.0'), null);
+});
+
+test('versionOnlyRelease: a pre-release label without its number is not part of a version', async () => {
+  assert.equal(await bump('1.0.0-beta', '1.0.0-beta1'), null);
+});
+
+// The fake serves manifests by ref: the merge base the comparison names, and the head.
+const servedManifests = Object.fromEntries(
+  Object.entries(RELEASE_MANIFESTS).map(([path, { base, head }]) => [path, { [MERGE_BASE]: base, [HEAD]: head }]),
+);
+const releasePr = (changed_files = RELEASE_FILES.length) => ({ ...openPr(), changed_files });
+const releaseRun = (given = {}) =>
+  fakeGithub({ prs: [releasePr()], commentsByCall: [[]], files: RELEASE_FILES, manifests: servedManifests, ...given });
+
+test('run: a version-only release PR passes both contexts without any review', async () => {
+  const { github, posted } = releaseRun();
+  await gate.run({ github, context: pushEvent, core: fakeCore().core });
+  const expected = 'version-only release: 1.0.0rc25 → 1.0.0rc26';
+  assert.deepEqual(
+    posted.map((s) => [s.context, s.state, s.description]),
+    [
+      ['codex-review', 'success', expected],
+      ['internal-review', 'success', expected],
+    ],
+  );
+});
+
+test('run: the diff judged is the one between the base and exactly the head the statuses go on', async () => {
+  const { github, compared, read } = releaseRun();
+  await gate.run({ github, context: pushEvent, core: fakeCore().core });
+  assert.deepEqual([...new Set(compared)], [`${BASE}...${HEAD}`]);
+  assert.deepEqual(
+    [...new Set(read)].sort(),
+    [`packages/validator/pyproject.toml@${HEAD}`, `packages/validator/pyproject.toml@${MERGE_BASE}`].sort(),
+  );
+});
+
+test('run: a diff GitHub returned only part of is gated like any PR', async () => {
+  const { github, posted } = releaseRun({ prs: [releasePr(RELEASE_FILES.length + 1)] });
+  await gate.run({ github, context: pushEvent, core: fakeCore().core });
+  assert.deepEqual(posted.map((s) => s.state), ['pending', 'pending']);
+});
+
+test('run: a PR changing more files than a comparison can list is never compared', async () => {
+  const { github, posted, compared } = releaseRun({ prs: [releasePr(301)] });
+  await gate.run({ github, context: pushEvent, core: fakeCore().core });
+  assert.deepEqual(compared, []);
+  assert.deepEqual(posted.map((s) => s.state), ['pending', 'pending']);
+});
+
+test('run: a failed read for the release check falls through to the reviews, and says so', async () => {
+  const { github, posted } = releaseRun({
+    prs: [releasePr()],
+    commentsByCall: [[comment(CODEX, CLEAN(HEAD), T1), comment(BOT, ATTEST(HEAD), T1)]],
+    compareFails: apiError(502),
+  });
+  const { core, log } = fakeCore();
+  await gate.run({ github, context: pushEvent, core });
+  assert.deepEqual(posted.map((s) => s.state), ['success', 'success']);
+  assert.match(posted[0].description, /Codex found no major issues/);
+  assert.equal(log.warnings.length, 1);
+  assert.match(log.warnings[0], /#7.*HTTP 502/);
+});
+
+test('run: a missing manifest falls through to the reviews', async () => {
+  const { github, posted } = releaseRun({ manifests: {} });
+  const { core, log } = fakeCore();
+  await gate.run({ github, context: pushEvent, core });
+  assert.deepEqual(posted.map((s) => s.state), ['pending', 'pending']);
+  assert.match(log.warnings[0], /HTTP 404/);
+});
+
+test('run: a manifest GitHub sends without content holds no own version', async () => {
+  const { github, posted } = releaseRun();
+  github.rest.repos.getContent = async () => ({ data: { type: 'file', encoding: 'none', content: '' } });
+  const { core, log } = fakeCore();
+  await gate.run({ github, context: pushEvent, core });
+  assert.deepEqual(posted.map((s) => s.state), ['pending', 'pending']);
+  assert.deepEqual(log.warnings, []);
+});
+
+test('run: an error that is not a failed request still crashes the gate', async () => {
+  const { github, posted } = releaseRun({ compareFails: new TypeError('bug') });
+  await assert.rejects(gate.run({ github, context: pushEvent, core: fakeCore().core }), /bug/);
+  assert.deepEqual([...new Set(posted.map((s) => s.state))], ['error']);
+});
+
+test('run: a release PR carrying any other change is gated like any PR', async () => {
+  const files = releaseWith('@@ -1 +1 @@\n-x = 1\n+x = 2\n');
+  const { github, posted } = releaseRun({ prs: [{ ...openPr(), changed_files: files.length }], files });
+  await gate.run({ github, context: pushEvent, core: fakeCore().core });
+  assert.deepEqual(posted.map((s) => s.state), ['pending', 'pending']);
 });

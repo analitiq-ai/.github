@@ -155,7 +155,34 @@ commit they name, so a push voids them without anyone revoking anything.
 | `codex-review` | Codex's newest verdict on the head commit is clean: its clean template ("Codex Review: Didn't find any major issues") with no findings preamble, or a [👍 tied to the head](#the-codex-thumbs-up) — or no verdict is on the head and the [credit waiver](#the-codex-credit-waiver) applies | `pending` |
 | `internal-review` | a comment from `Analitiq-Bot` carries the attestation marker and names the head commit | `pending` |
 
-A crash in the gate posts `error` on both, which still blocks a merge.
+A [version-only release](#version-only-releases) passes both with `success`
+and needs neither review. A crash in the gate posts `error` on both, which
+still blocks a merge.
+
+### Version-only releases
+
+A PR whose diff, read for exactly its head, only moves its package's own
+version up (and any pins of it with it) gets `success` on both statuses, and
+both read `version-only release: OLD → NEW`. It qualifies only if all of these
+hold:
+
+- every file is modified, and GitHub returns its text patch (nothing added,
+  removed or renamed, no binary or oversized file, no truncated comparison;
+  a PR changing more than 300 files is never compared);
+- every changed line is replaced in place by a line that differs only in
+  whole version tokens, each moved `OLD → NEW`, the same pair across the PR. A
+  version token is `x.y.z`, optionally followed by a pre-release suffix
+  `a`/`alpha`/`b`/`beta`/`rc`/`dev` plus a number (`rc26`, `-beta1`);
+- a changed `pyproject.toml` declares `OLD` at the merge base and `NEW` at the
+  head as its own version (`version` under `[project]` or `[tool.poetry]`), or a
+  changed `package.json` does as its top-level `"version"`;
+- `NEW` is greater than `OLD`. Two pre-releases under different labels
+  (`a1 → rc1`) do not compare, so they do not qualify.
+
+A dependency, action or image pin never qualifies on its own, and neither does
+a downgrade. If a request this check makes fails, the PR is gated by its
+reviews as usual and the run logs a warning. CI and every other required check
+still run. Any push re-evaluates the head.
 
 ### The internal-review attestation
 
