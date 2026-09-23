@@ -161,24 +161,28 @@ still blocks a merge.
 
 ### Version-only releases
 
-A PR whose diff, read for exactly its head, only moves the package's own
-version up and every pin of it with it, gets `success` on both statuses, and
+A PR whose diff, read for exactly its head, only moves its package's own
+version up (and any pins of it with it) gets `success` on both statuses, and
 both read `version-only release: OLD → NEW`. It qualifies only if all of these
 hold:
 
 - every file is modified, and GitHub returns its text patch (nothing added,
-  removed or renamed, no binary or oversized file, no truncated file list);
+  removed or renamed, no binary or oversized file, no truncated comparison;
+  a PR changing more than 300 files is never compared);
 - every changed line is replaced in place by a line that differs only in one
-  whole version token, `x.y.z` plus an optional letters-then-digits pre-release
-  suffix (`rc26`, `-beta1`), and the same `OLD → NEW` pair holds across the PR;
-- one of those lines is the package's own version declaration: `version =
-  "OLD"` in a `pyproject.toml`, or `"version": "OLD"` in a `package.json`;
+  whole version token, and the same `OLD → NEW` pair holds across the PR. A
+  version token is `x.y.z`, optionally followed by a pre-release suffix
+  `a`/`alpha`/`b`/`beta`/`rc`/`dev` plus a number (`rc26`, `-beta1`);
+- a changed `pyproject.toml` declares `OLD` at the merge base and `NEW` at the
+  head as its own version (`version` under `[project]` or `[tool.poetry]`), or a
+  changed `package.json` does as its top-level `"version"`;
 - `NEW` is greater than `OLD`. Two pre-releases under different labels
   (`a1 → rc1`) do not compare, so they do not qualify.
 
-A lone dependency, action or image pin never qualifies, and neither does a
-downgrade. CI and every other required check still run. Any push re-evaluates
-the head, so adding another change drops the PR back to normal gating.
+A dependency, action or image pin never qualifies on its own, and neither does
+a downgrade. If a request this check makes fails, the PR is gated by its
+reviews as usual and the run logs a warning. CI and every other required check
+still run. Any push re-evaluates the head.
 
 ### The internal-review attestation
 

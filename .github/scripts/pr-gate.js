@@ -259,30 +259,20 @@ function internalReviewStatus({ comments, head }) {
 }
 
 // Exactly x.y.z, so neither a float constant (0.5) nor an IP address
-// (10.1.2.3) is a version, plus an optional pre-release suffix: letters then
-// digits (rc26, -beta1). Whole tokens only: neither `a1.0.0` nor
-// `1.0.0rc25.tar` holds a version. The capture makes split() interleave text
-// and versions, versions at the odd indices.
-const VERSION = String.raw`\d+\.\d+\.\d+(?:-?[A-Za-z]+\d*)?`;
+// (10.1.2.3) is a version, plus an optional pre-release suffix: a label PEP 440
+// and semver both rank before the release, then its number (rc26, -beta1). Any
+// other suffix (post1, beta) leaves no version token, so the line is not a
+// version change. Whole tokens only: neither `a1.0.0` nor `1.0.0rc25.tar`
+// holds a version. The capture makes split() interleave text and versions,
+// versions at the odd indices.
+const VERSION = String.raw`\d+\.\d+\.\d+(?:-?(?:alpha|a|beta|b|rc|dev)\d+)?`;
 const VERSION_TOKEN = new RegExp(String.raw`(?<![\w.])(${VERSION})(?![\w.])`);
-const VERSION_PARTS = /^(\d+)\.(\d+)\.(\d+)(?:-?([A-Za-z]+)(\d*))?$/;
-
-// Where a package declares its own version, by manifest file name.
-const OWN_VERSION_DECLARATIONS = {
-  'pyproject.toml': new RegExp(String.raw`^\s*version\s*=\s*"(${VERSION})"\s*$`),
-  'package.json': new RegExp(String.raw`^\s*"version"\s*:\s*"(${VERSION})"\s*,?\s*$`),
-};
-
-// The version a line declares as its package's own, or null.
-function ownVersionDeclared(filename, line) {
-  const declaration = OWN_VERSION_DECLARATIONS[filename.split('/').pop()];
-  return declaration?.exec(line)?.[1] ?? null;
-}
+const VERSION_PARTS = /^(\d+)\.(\d+)\.(\d+)(?:-?([a-z]+)(\d+))?$/;
 
 // Whether `to` is a greater version than `from`. A release outranks its
 // pre-releases; two pre-releases of one x.y.z are ordered only by number and
-// only under the same label, because labels have no order both PEP 440 and
-// semver agree on (PEP 440's `dev` precedes `a`).
+// only under the same label, because PEP 440 and semver order labels
+// differently (PEP 440's `dev` precedes `a`).
 function isGreater(to, from) {
   const [, ...next] = VERSION_PARTS.exec(to);
   const [, ...last] = VERSION_PARTS.exec(from);
@@ -341,16 +331,12 @@ function replacedLines(patch) {
   return closeBlock() ? pairs : null;
 }
 
-// A PR whose whole diff moves its package's own version up to the next one,
-// with every pin of it, changes nothing a reviewer could judge: what it
-// releases was reviewed when it merged. Returns that bump, or null when any
-// file, hunk or line does more. A file-level change (added, removed, renamed)
-// or a missing patch (binary, too large) disqualifies: the diff cannot be read
-// in full. A lone dependency pin never qualifies: no own version declaration
-// moves.
-function versionOnlyRelease(files) {
+// The one version substitution a whole diff makes, or null when any file,
+// hunk or line does anything else. A file-level change (added, removed,
+// renamed) or a missing patch (binary, too large) disqualifies: the diff
+// cannot be read in full.
+function soleVersionChange(files) {
   const substitutions = new Set();
-  const declared = new Set();
   for (const file of files) {
     if (file.status !== 'modified' || typeof file.patch !== 'string') return null;
     const pairs = replacedLines(file.patch);
@@ -359,13 +345,93 @@ function versionOnlyRelease(files) {
       const found = lineSubstitutions(removed, added);
       if (found === null) return null;
       found.forEach((substitution) => substitutions.add(substitution));
-      const own = ownVersionDeclared(file.filename, removed);
-      if (own !== null) declared.add(own);
     }
   }
   if (substitutions.size !== 1) return null;
   const [from, to] = [...substitutions][0].split('\n');
-  return declared.has(from) && isGreater(to, from) ? { from, to } : null;
+  return { from, to };
+}
+
+// The version a manifest declares for its own package, by file name, or null.
+// Read from the manifest's structure, because a patch line cannot show which
+// table or depth it sits in: a `version` under a Poetry dependency sub-table,
+// or nested in package.json, is a pin, not the package's version.
+const OWN_VERSION_READERS = {
+  'package.json': (text) => {
+    let manifest;
+    try {
+      manifest = JSON.parse(text);
+    } catch {
+      return null; // not a manifest that declares anything
+    }
+    return typeof manifest?.version === 'string' ? manifest.version : null;
+  },
+  // Only [project] (PEP 621) and [tool.poetry] declare the package; a header
+  // written any other way ([[array]], quoted keys) ends the search, which
+  // fails closed.
+  'pyproject.toml': (text) => {
+    let table = null;
+    for (const line of text.split('\n')) {
+      if (/^\s*\[/.test(line)) {
+        table = /^\s*\[([\w.]+)\]\s*(?:#.*)?$/.exec(line)?.[1] ?? null;
+      } else if (table === 'project' || table === 'tool.poetry') {
+        const declared = /^\s*version\s*=\s*"([^"]*)"\s*(?:#.*)?$/.exec(line);
+        if (declared) return declared[1];
+      }
+    }
+    return null;
+  },
+};
+const ownVersionReader = (filename) => OWN_VERSION_READERS[filename.split('/').pop()];
+
+// A PR whose whole diff moves its package's own version up, and any pins of it
+// with it, changes nothing a reviewer could judge: what it releases was
+// reviewed when it merged. Returns that bump, or null.
+// read(side, path): a changed file's text at 'base' (the merge base) or 'head',
+// or null when it cannot be read as text.
+// Called only for manifests in a diff that already passed as one version
+// change, so the reads a normal PR costs are none.
+async function versionOnlyRelease({ files, read }) {
+  const change = soleVersionChange(files);
+  if (change === null || !isGreater(change.to, change.from)) return null;
+  for (const { filename } of files) {
+    const ownVersion = ownVersionReader(filename);
+    if (ownVersion === undefined) continue;
+    const declared = async (side) => {
+      const text = await read(side, filename);
+      return text === null ? null : ownVersion(text);
+    };
+    if ((await declared('base')) === change.from && (await declared('head')) === change.to) return change;
+  }
+  return null;
+}
+
+// A comparison lists at most this many files; a PR changing more can never be
+// read in full, so it is not compared at all.
+const MAX_COMPARED_FILES = 300;
+
+// The version-only release pr.head.sha is, or null. Reads the diff for exactly
+// that head, not the PR's file list, which follows the branch as it moves.
+async function readRelease({ github, owner, repo, pr }) {
+  if (!Number.isInteger(pr.changed_files)) {
+    throw new Error(`pull request has no changed-file count: ${JSON.stringify(pr.changed_files)}`);
+  }
+  if (pr.changed_files === 0 || pr.changed_files > MAX_COMPARED_FILES) return null;
+  const { data: comparison } = await github.rest.repos.compareCommitsWithBasehead({
+    owner,
+    repo,
+    basehead: `${pr.base.sha}...${pr.head.sha}`,
+  });
+  const files = comparison.files ?? [];
+  if (files.length !== pr.changed_files) return null;
+  const refs = { base: comparison.merge_base_commit.sha, head: pr.head.sha };
+  const read = async (side, path) => {
+    const { data } = await github.rest.repos.getContent({ owner, repo, path, ref: refs[side] });
+    // Over 1 MB GitHub sends no content; a manifest it will not show is none.
+    if (data.type !== 'file' || data.encoding !== 'base64') return null;
+    return Buffer.from(data.content, 'base64').toString('utf8');
+  };
+  return versionOnlyRelease({ files, read });
 }
 
 // Newest first, which is the order the API returns and `history` keeps.
@@ -395,21 +461,17 @@ async function post({ github, core, owner, repo, pr, history, context, status })
   core.info(`PR #${pr.number} @ ${short(pr.head.sha)}: ${context} -> ${status.state} (${description})`);
 }
 
-async function readStatuses({ github, owner, repo, pr }) {
+async function readStatuses({ github, core, owner, repo, pr }) {
   const head = pr.head.sha;
-  if (!Number.isInteger(pr.changed_files)) {
-    throw new Error(`pull request has no changed-file count: ${JSON.stringify(pr.changed_files)}`);
+  // The exemption only ever adds a way to pass: a request it makes failing
+  // leaves the PR to its reviews, never to an error status they would clear.
+  let release = null;
+  try {
+    release = await readRelease({ github, owner, repo, pr });
+  } catch (error) {
+    if (typeof error?.status !== 'number') throw error;
+    core.warning(`PR #${pr.number}: version-only release check skipped: ${error}`);
   }
-  // Read for exactly the head the statuses go on: the PR's file list follows
-  // whatever the branch points at by the time it is read. GitHub caps the
-  // comparison's files, and a diff read only in part is never a release.
-  const { data: comparison } = await github.rest.repos.compareCommitsWithBasehead({
-    owner,
-    repo,
-    basehead: `${pr.base.sha}...${head}`,
-  });
-  const files = comparison.files ?? [];
-  const release = files.length === pr.changed_files ? versionOnlyRelease(files) : null;
   if (release !== null) {
     const status = { state: 'success', description: `version-only release: ${release.from} → ${release.to}` };
     return { [CODEX_CONTEXT]: status, [INTERNAL_CONTEXT]: status };
@@ -469,7 +531,7 @@ async function readStatuses({ github, owner, repo, pr }) {
 }
 
 async function evaluateHead({ github, core, owner, repo, pr, history }) {
-  let wanted = await readStatuses({ github, owner, repo, pr });
+  let wanted = await readStatuses({ github, core, owner, repo, pr });
 
   // Statuses are last-writer-wins, and the sweep runs outside the per-PR
   // concurrency group. A run working from a snapshot taken before a verdict
@@ -481,7 +543,7 @@ async function evaluateHead({ github, core, owner, repo, pr, history }) {
     return status.state !== 'success' && (!current || current.state === 'success');
   });
   if (aboutToDemote) {
-    wanted = await readStatuses({ github, owner, repo, pr });
+    wanted = await readStatuses({ github, core, owner, repo, pr });
   }
 
   for (const [context, status] of Object.entries(wanted)) {
