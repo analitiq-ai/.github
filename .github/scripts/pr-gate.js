@@ -8,7 +8,7 @@
 //                    commit (verifiable only as far as author + SHA).
 //
 // A version-only release PR (see versionOnlyRelease) passes both without
-// either review; its description is "version-only release: OLD → NEW".
+// either review; both statuses then read "version-only release: OLD → NEW".
 //
 // Both are bound to a SHA for the same reason: a push moves the head, and a
 // verdict for the old head must stop counting without anyone remembering to
@@ -258,10 +258,43 @@ function internalReviewStatus({ comments, head }) {
     : { state: 'pending', description: `Waiting for an internal review of ${short(head)}` };
 }
 
-// At least two dots, so a float constant (0.5 -> 0.6) is never a version.
-// Whole tokens only: `1.0.0rc25x` is not the version 1.0.0rc25. The capture
-// makes split() interleave text and versions, versions at the odd indices.
-const VERSION_TOKEN = /(?<![\w.])(\d+(?:\.\d+){2,}(?:[-+]?[A-Za-z]\w*)?)(?![\w.])/;
+// Exactly x.y.z, so neither a float constant (0.5) nor an IP address
+// (10.1.2.3) is a version, plus an optional pre-release suffix: letters then
+// digits (rc26, -beta1). Whole tokens only: neither `a1.0.0` nor
+// `1.0.0rc25.tar` holds a version. The capture makes split() interleave text
+// and versions, versions at the odd indices.
+const VERSION = String.raw`\d+\.\d+\.\d+(?:-?[A-Za-z]+\d*)?`;
+const VERSION_TOKEN = new RegExp(String.raw`(?<![\w.])(${VERSION})(?![\w.])`);
+const VERSION_PARTS = /^(\d+)\.(\d+)\.(\d+)(?:-?([A-Za-z]+)(\d*))?$/;
+
+// Where a package declares its own version, by manifest file name.
+const OWN_VERSION_DECLARATIONS = {
+  'pyproject.toml': new RegExp(String.raw`^\s*version\s*=\s*"(${VERSION})"\s*$`),
+  'package.json': new RegExp(String.raw`^\s*"version"\s*:\s*"(${VERSION})"\s*,?\s*$`),
+};
+
+// The version a line declares as its package's own, or null.
+function ownVersionDeclared(filename, line) {
+  const declaration = OWN_VERSION_DECLARATIONS[filename.split('/').pop()];
+  return declaration?.exec(line)?.[1] ?? null;
+}
+
+// Whether `to` is a greater version than `from`. A release outranks its
+// pre-releases; two pre-releases of one x.y.z are ordered only by number and
+// only under the same label, because labels have no order both PEP 440 and
+// semver agree on (PEP 440's `dev` precedes `a`).
+function isGreater(to, from) {
+  const [, ...next] = VERSION_PARTS.exec(to);
+  const [, ...last] = VERSION_PARTS.exec(from);
+  for (let i = 0; i < 3; i += 1) {
+    if (Number(next[i]) !== Number(last[i])) return Number(next[i]) > Number(last[i]);
+  }
+  const [nextLabel, nextNumber] = next.slice(3);
+  const [lastLabel, lastNumber] = last.slice(3);
+  if (lastLabel === undefined) return false;
+  if (nextLabel === undefined) return true;
+  return nextLabel === lastLabel && Number(nextNumber) > Number(lastNumber);
+}
 
 // The version substitutions turning `removed` into `added`, or null when
 // anything other than version tokens differs between them.
@@ -278,19 +311,15 @@ function lineSubstitutions(removed, added) {
   return substitutions;
 }
 
-// Every substitution in a patch, or null when a hunk holds anything but
-// removed lines each followed, in order, by its added replacement.
-function patchSubstitutions(patch) {
-  const substitutions = [];
+// A patch's changed lines as [removed, added] pairs, or null when a hunk holds
+// anything but removed lines each followed, in order, by its added replacement.
+function replacedLines(patch) {
+  const pairs = [];
   let removed = [];
   let added = [];
   const closeBlock = () => {
     if (removed.length !== added.length) return false;
-    for (let i = 0; i < removed.length; i += 1) {
-      const line = lineSubstitutions(removed[i], added[i]);
-      if (line === null) return false;
-      substitutions.push(...line);
-    }
+    removed.forEach((line, i) => pairs.push([line, added[i]]));
     removed = [];
     added = [];
     return true;
@@ -309,25 +338,34 @@ function patchSubstitutions(patch) {
       return null;
     }
   }
-  return closeBlock() ? substitutions : null;
+  return closeBlock() ? pairs : null;
 }
 
-// A PR whose whole diff replaces one version with another, in place, changes
-// nothing a reviewer could judge: what it releases was reviewed when it merged.
-// Returns that bump, or null when any file, hunk or line does more. Any
-// file-level change (added, removed, renamed) or a missing patch (binary, too
-// large) disqualifies, since the diff cannot be read in full.
+// A PR whose whole diff moves its package's own version up to the next one,
+// with every pin of it, changes nothing a reviewer could judge: what it
+// releases was reviewed when it merged. Returns that bump, or null when any
+// file, hunk or line does more. A file-level change (added, removed, renamed)
+// or a missing patch (binary, too large) disqualifies: the diff cannot be read
+// in full. A lone dependency pin never qualifies: no own version declaration
+// moves.
 function versionOnlyRelease(files) {
   const substitutions = new Set();
+  const declared = new Set();
   for (const file of files) {
     if (file.status !== 'modified' || typeof file.patch !== 'string') return null;
-    const found = patchSubstitutions(file.patch);
-    if (found === null) return null;
-    found.forEach((s) => substitutions.add(s));
+    const pairs = replacedLines(file.patch);
+    if (pairs === null) return null;
+    for (const [removed, added] of pairs) {
+      const found = lineSubstitutions(removed, added);
+      if (found === null) return null;
+      found.forEach((substitution) => substitutions.add(substitution));
+      const own = ownVersionDeclared(file.filename, removed);
+      if (own !== null) declared.add(own);
+    }
   }
   if (substitutions.size !== 1) return null;
   const [from, to] = [...substitutions][0].split('\n');
-  return { from, to };
+  return declared.has(from) && isGreater(to, from) ? { from, to } : null;
 }
 
 // Newest first, which is the order the API returns and `history` keeps.
@@ -359,13 +397,19 @@ async function post({ github, core, owner, repo, pr, history, context, status })
 
 async function readStatuses({ github, owner, repo, pr }) {
   const head = pr.head.sha;
-  const files = await github.paginate(github.rest.pulls.listFiles, {
+  if (!Number.isInteger(pr.changed_files)) {
+    throw new Error(`pull request has no changed-file count: ${JSON.stringify(pr.changed_files)}`);
+  }
+  // Read for exactly the head the statuses go on: the PR's file list follows
+  // whatever the branch points at by the time it is read. GitHub caps the
+  // comparison's files, and a diff read only in part is never a release.
+  const { data: comparison } = await github.rest.repos.compareCommitsWithBasehead({
     owner,
     repo,
-    pull_number: pr.number,
-    per_page: 100,
+    basehead: `${pr.base.sha}...${head}`,
   });
-  const release = versionOnlyRelease(files);
+  const files = comparison.files ?? [];
+  const release = files.length === pr.changed_files ? versionOnlyRelease(files) : null;
   if (release !== null) {
     const status = { state: 'success', description: `version-only release: ${release.from} → ${release.to}` };
     return { [CODEX_CONTEXT]: status, [INTERNAL_CONTEXT]: status };

@@ -7,6 +7,7 @@ const gate = require('../.github/scripts/pr-gate.js');
 
 const HEAD = '99ed81fce1f091223f9fcbac24070ea192da1622';
 const OTHER = '128ed7ba3cf9387775318f9982b6b816193d4f47';
+const BASE = 'bd8be443d5691dcc8043ea031f94a5d9be622913';
 const HEAD10 = HEAD.slice(0, 10);
 const CODEX = 'chatgpt-codex-connector[bot]';
 const BOT = 'Analitiq-Bot';
@@ -584,6 +585,7 @@ function fakeGithub({
   failFor = [],
 }) {
   const posted = [];
+  const compared = [];
   let reads = 0;
   const rest = {
     pulls: {
@@ -593,7 +595,6 @@ function fakeGithub({
       },
       list: async () => ({ data: prs.filter((p) => p.state === 'open') }),
       listReviews: async () => ({ data: reviews }),
-      listFiles: async () => ({ data: files }),
     },
     issues: {
       listComments: async () => ({ data: commentsByCall[Math.min(reads++, commentsByCall.length - 1)] }),
@@ -606,6 +607,10 @@ function fakeGithub({
       listSuitesForRef: async () => ({ data: { total_count: suites.length, check_suites: suites } }),
     },
     repos: {
+      compareCommitsWithBasehead: async ({ basehead }) => {
+        compared.push(basehead);
+        return { data: { files } };
+      },
       // newest first, as the API returns them
       listCommitStatusesForRef: async () => ({ data: statuses }),
       createCommitStatus: async (s) => {
@@ -620,7 +625,7 @@ function fakeGithub({
     const { data } = await fn(params);
     return Array.isArray(data) ? data : data.check_suites;
   };
-  return { posted, github: { rest, paginate } };
+  return { posted, compared, github: { rest, paginate } };
 }
 
 const fakeCore = () => {
@@ -640,6 +645,8 @@ const openPr = (number = 7) => ({
   number,
   state: 'open',
   head: { sha: HEAD },
+  base: { sha: BASE },
+  changed_files: 0,
   html_url: `https://example.test/pr/${number}`,
   created_at: BEFORE,
   updated_at: T3,
@@ -963,8 +970,8 @@ test('run: the sweep evaluates every open PR and one failure does not starve the
   assert.match(log.errors[0], /pr-gate\.test\.js/, 'the stack, not just the message');
 });
 
-// The shape of a real release PR: one version replaced by another, in place,
-// across several files and hunks.
+// The shape of a real release PR: the package's own version declaration and
+// every pin of it, moved from one version to the next in place.
 const modified = (filename, patch) => ({ filename, status: 'modified', patch });
 const RELEASE_FILES = [
   modified(
@@ -978,14 +985,25 @@ const RELEASE_FILES = [
   ),
 ];
 const RELEASE = { from: '1.0.0rc25', to: '1.0.0rc26' };
-const withPatch = (patch) => [...RELEASE_FILES, modified('extra.py', patch)];
+// The release plus one more file, which uses the release's own pair so that
+// only the rule a case names can reject it.
+const releaseWith = (patch, filename = 'extra.py') => [...RELEASE_FILES, modified(filename, patch)];
+// A PR that moves nothing but the version declaration.
+const declared = (from, to, filename = 'pyproject.toml') =>
+  modified(filename, `@@ -1 +1 @@\n-version = "${from}"\n+version = "${to}"\n`);
+const bump = (from, to) => gate.versionOnlyRelease([declared(from, to)]);
 
-test('versionOnlyRelease: one version replaced by another everywhere qualifies', () => {
+test('versionOnlyRelease: the own version and every pin of it moved to the next version qualifies', () => {
   assert.deepEqual(gate.versionOnlyRelease(RELEASE_FILES), RELEASE);
 });
 
 test('versionOnlyRelease: a line that keeps an unchanged version beside the bumped one still qualifies', () => {
-  assert.deepEqual(gate.versionOnlyRelease(withPatch('@@ -1 +1 @@\n-a = "2.0.0" b = "1.0.0rc25"\n+a = "2.0.0" b = "1.0.0rc26"\n')), RELEASE);
+  assert.deepEqual(gate.versionOnlyRelease(releaseWith('@@ -1 +1 @@\n-a = "2.0.0" b = "1.0.0rc25"\n+a = "2.0.0" b = "1.0.0rc26"\n')), RELEASE);
+});
+
+test('versionOnlyRelease: a package.json version declaration counts as the own version', () => {
+  const file = modified('web/package.json', '@@ -2 +2 @@\n-  "version": "1.2.3",\n+  "version": "1.2.4",\n');
+  assert.deepEqual(gate.versionOnlyRelease([file]), { from: '1.2.3', to: '1.2.4' });
 });
 
 test('versionOnlyRelease: a PR with no files does not qualify', () => {
@@ -994,7 +1012,7 @@ test('versionOnlyRelease: a PR with no files does not qualify', () => {
 
 for (const status of ['added', 'removed', 'renamed', 'copied', 'changed']) {
   test(`versionOnlyRelease: a ${status} file disqualifies`, () => {
-    assert.equal(gate.versionOnlyRelease([...RELEASE_FILES, { ...RELEASE_FILES[0], filename: 'x', status }]), null);
+    assert.equal(gate.versionOnlyRelease([...RELEASE_FILES, { ...RELEASE_FILES[1], filename: 'x', status }]), null);
   });
 }
 
@@ -1002,31 +1020,69 @@ test('versionOnlyRelease: a file without a text patch (binary or too large) disq
   assert.equal(gate.versionOnlyRelease([...RELEASE_FILES, { filename: 'x.bin', status: 'modified' }]), null);
 });
 
-const DISQUALIFYING = {
+const DISQUALIFYING_EXTRA = {
   'an added line with no removed partner': '@@ -1,1 +1,2 @@\n-v = "1.0.0rc25"\n+v = "1.0.0rc26"\n+evil()\n',
   'a removed line with no added partner': '@@ -1,2 +1,1 @@\n-v = "1.0.0rc25"\n-guard()\n+v = "1.0.0rc26"\n',
-  'a removed line paired with an added line across context':
-    '@@ -1,3 +1,3 @@\n-v = "1.0.0rc25"\n guard()\n+v = "1.0.0rc26"\n',
+  'a removed line paired with an added line across context': '@@ -1,3 +1,3 @@\n-v = "1.0.0rc25"\n guard()\n+v = "1.0.0rc26"\n',
   'an edit beside the version': '@@ -1 +1 @@\n-v = "1.0.0rc25"  # a\n+v = "1.0.0rc26"  # b\n',
   'a line changed without any version': '@@ -1 +1 @@\n-x = 1\n+x = 2\n',
   'a second version pair': '@@ -1 +1 @@\n-dep==2.0.0\n+dep==2.0.1\n',
-  'a version going the other way': '@@ -1 +1 @@\n-v = "1.0.0rc26"\n+v = "1.0.0rc25"\n',
-  'a float constant, which is not a version': '@@ -1 +1 @@\n-threshold = 0.5\n+threshold = 0.6\n',
-  'a version that is only part of a longer token': '@@ -1 +1 @@\n-url = "1.0.0rc25x"\n+url = "1.0.0rc26x"\n',
+  'the version glued to a leading word character': '@@ -1 +1 @@\n-v = "a1.0.0rc25"\n+v = "a1.0.0rc26"\n',
+  'the version glued to a trailing extension': '@@ -1 +1 @@\n-v = "1.0.0rc25.tar"\n+v = "1.0.0rc26.tar"\n',
   'a no-newline marker': '@@ -1 +1 @@\n-v = "1.0.0rc25"\n\\ No newline at end of file\n+v = "1.0.0rc26"\n\\ No newline at end of file\n',
 };
-for (const [what, patch] of Object.entries(DISQUALIFYING)) {
+for (const [what, patch] of Object.entries(DISQUALIFYING_EXTRA)) {
   test(`versionOnlyRelease: ${what} disqualifies`, () => {
-    assert.equal(gate.versionOnlyRelease(withPatch(patch)), null);
+    assert.equal(gate.versionOnlyRelease(releaseWith(patch)), null);
   });
 }
 
-test('versionOnlyRelease: a line replaced by itself is not a bump', () => {
-  assert.equal(gate.versionOnlyRelease([modified('a', '@@ -1 +1 @@\n-v = "1.0.0"\n+v = "1.0.0"\n')]), null);
+test('versionOnlyRelease: pins moved without the own version declaration do not qualify', () => {
+  assert.equal(gate.versionOnlyRelease([RELEASE_FILES[1]]), null);
+  const dependency = modified('pyproject.toml', '@@ -1 +1 @@\n-    "requests==2.31.0",\n+    "requests==2.32.0",\n');
+  assert.equal(gate.versionOnlyRelease([dependency]), null);
 });
 
+test('versionOnlyRelease: a version declaration outside pyproject.toml or package.json is not the own version', () => {
+  assert.equal(gate.versionOnlyRelease([declared('1.0.0', '1.0.1', 'scripts/pins.py')]), null);
+});
+
+test('versionOnlyRelease: a version with a fourth dotted part is not a version', () => {
+  assert.equal(bump('1.0.0.1', '1.0.0.2'), null);
+});
+
+test('versionOnlyRelease: a line replaced by itself is not a bump', () => {
+  assert.equal(bump('1.0.0', '1.0.0'), null);
+});
+
+test('versionOnlyRelease: only a move to a greater version qualifies', () => {
+  for (const [from, to] of [
+    ['1.0.0rc25', '1.0.0rc26'],
+    ['1.0.0rc26', '1.0.0'],
+    ['1.9.0', '1.10.0'],
+    ['1.0.9', '1.1.0'],
+    ['1.2.3-beta1', '1.2.3-beta2'],
+  ]) {
+    assert.deepEqual(bump(from, to), { from, to }, `${from} -> ${to}`);
+  }
+  for (const [from, to] of [
+    ['1.0.1', '1.0.0'],
+    ['1.0.0rc26', '1.0.0rc25'],
+    ['1.0.0', '1.0.0rc26'],
+    ['1.10.0', '1.9.0'],
+  ]) {
+    assert.equal(bump(from, to), null, `${from} -> ${to}`);
+  }
+});
+
+test('versionOnlyRelease: pre-releases with different labels are not comparable', () => {
+  assert.equal(bump('1.0.0a1', '1.0.0rc1'), null);
+});
+
+const releasePr = (changed_files = RELEASE_FILES.length) => ({ ...openPr(), changed_files });
+
 test('run: a version-only release PR passes both contexts without any review', async () => {
-  const { github, posted } = fakeGithub({ prs: [openPr()], commentsByCall: [[]], files: RELEASE_FILES });
+  const { github, posted } = fakeGithub({ prs: [releasePr()], commentsByCall: [[]], files: RELEASE_FILES });
   await gate.run({ github, context: pushEvent, core: fakeCore().core });
   const expected = 'version-only release: 1.0.0rc25 → 1.0.0rc26';
   assert.deepEqual(
@@ -1038,9 +1094,21 @@ test('run: a version-only release PR passes both contexts without any review', a
   );
 });
 
+test('run: the diff judged is the one between the base and exactly the head the statuses go on', async () => {
+  const { github, compared } = fakeGithub({ prs: [releasePr()], commentsByCall: [[]], files: RELEASE_FILES });
+  await gate.run({ github, context: pushEvent, core: fakeCore().core });
+  assert.deepEqual([...new Set(compared)], [`${BASE}...${HEAD}`]);
+});
+
+test('run: a diff GitHub returned only part of is gated like any PR', async () => {
+  const { github, posted } = fakeGithub({ prs: [releasePr(RELEASE_FILES.length + 1)], commentsByCall: [[]], files: RELEASE_FILES });
+  await gate.run({ github, context: pushEvent, core: fakeCore().core });
+  assert.deepEqual(posted.map((s) => s.state), ['pending', 'pending']);
+});
+
 test('run: a release PR carrying any other change is gated like any PR', async () => {
-  const files = withPatch('@@ -1 +1 @@\n-x = 1\n+x = 2\n');
-  const { github, posted } = fakeGithub({ prs: [openPr()], commentsByCall: [[]], files });
+  const files = releaseWith('@@ -1 +1 @@\n-x = 1\n+x = 2\n');
+  const { github, posted } = fakeGithub({ prs: [{ ...openPr(), changed_files: files.length }], commentsByCall: [[]], files });
   await gate.run({ github, context: pushEvent, core: fakeCore().core });
   assert.deepEqual(posted.map((s) => s.state), ['pending', 'pending']);
 });

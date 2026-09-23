@@ -155,7 +155,30 @@ commit they name, so a push voids them without anyone revoking anything.
 | `codex-review` | Codex's newest verdict on the head commit is clean: its clean template ("Codex Review: Didn't find any major issues") with no findings preamble, or a [👍 tied to the head](#the-codex-thumbs-up) — or no verdict is on the head and the [credit waiver](#the-codex-credit-waiver) applies | `pending` |
 | `internal-review` | a comment from `Analitiq-Bot` carries the attestation marker and names the head commit | `pending` |
 
-A crash in the gate posts `error` on both, which still blocks a merge.
+A [version-only release](#version-only-releases) passes both with `success`
+and needs neither review. A crash in the gate posts `error` on both, which
+still blocks a merge.
+
+### Version-only releases
+
+A PR whose diff, read for exactly its head, only moves the package's own
+version up and every pin of it with it, gets `success` on both statuses, and
+both read `version-only release: OLD → NEW`. It qualifies only if all of these
+hold:
+
+- every file is modified, and GitHub returns its text patch (nothing added,
+  removed or renamed, no binary or oversized file, no truncated file list);
+- every changed line is replaced in place by a line that differs only in one
+  whole version token, `x.y.z` plus an optional letters-then-digits pre-release
+  suffix (`rc26`, `-beta1`), and the same `OLD → NEW` pair holds across the PR;
+- one of those lines is the package's own version declaration: `version =
+  "OLD"` in a `pyproject.toml`, or `"version": "OLD"` in a `package.json`;
+- `NEW` is greater than `OLD`. Two pre-releases under different labels
+  (`a1 → rc1`) do not compare, so they do not qualify.
+
+A lone dependency, action or image pin never qualifies, and neither does a
+downgrade. CI and every other required check still run. Any push re-evaluates
+the head, so adding another change drops the PR back to normal gating.
 
 ### The internal-review attestation
 
