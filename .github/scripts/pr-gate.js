@@ -7,6 +7,9 @@
 //   internal-review  Analitiq-Bot attested a clean internal review of THIS
 //                    commit (verifiable only as far as author + SHA).
 //
+// A version-only release PR (see versionOnlyRelease) passes both without
+// either review; its description is "version-only release: OLD → NEW".
+//
 // Both are bound to a SHA for the same reason: a push moves the head, and a
 // verdict for the old head must stop counting without anyone remembering to
 // revoke it.
@@ -255,6 +258,78 @@ function internalReviewStatus({ comments, head }) {
     : { state: 'pending', description: `Waiting for an internal review of ${short(head)}` };
 }
 
+// At least two dots, so a float constant (0.5 -> 0.6) is never a version.
+// Whole tokens only: `1.0.0rc25x` is not the version 1.0.0rc25. The capture
+// makes split() interleave text and versions, versions at the odd indices.
+const VERSION_TOKEN = /(?<![\w.])(\d+(?:\.\d+){2,}(?:[-+]?[A-Za-z]\w*)?)(?![\w.])/;
+
+// The version substitutions turning `removed` into `added`, or null when
+// anything other than version tokens differs between them.
+function lineSubstitutions(removed, added) {
+  const before = removed.split(VERSION_TOKEN);
+  const after = added.split(VERSION_TOKEN);
+  if (before.length !== after.length) return null;
+  const substitutions = [];
+  for (let i = 0; i < before.length; i += 1) {
+    if (before[i] === after[i]) continue;
+    if (i % 2 === 0) return null;
+    substitutions.push(`${before[i]}\n${after[i]}`);
+  }
+  return substitutions;
+}
+
+// Every substitution in a patch, or null when a hunk holds anything but
+// removed lines each followed, in order, by its added replacement.
+function patchSubstitutions(patch) {
+  const substitutions = [];
+  let removed = [];
+  let added = [];
+  const closeBlock = () => {
+    if (removed.length !== added.length) return false;
+    for (let i = 0; i < removed.length; i += 1) {
+      const line = lineSubstitutions(removed[i], added[i]);
+      if (line === null) return false;
+      substitutions.push(...line);
+    }
+    removed = [];
+    added = [];
+    return true;
+  };
+  for (const line of patch.split('\n')) {
+    const kind = line[0];
+    // A context line, a hunk header, or the patch's trailing newline.
+    const boundary = kind === ' ' || kind === '@' || line === '';
+    if ((boundary || (kind === '-' && added.length > 0)) && !closeBlock()) return null;
+    if (kind === '-') {
+      removed.push(line.slice(1));
+    } else if (kind === '+') {
+      added.push(line.slice(1));
+    } else if (!boundary) {
+      // '\ No newline at end of file', or anything else a patch should not hold
+      return null;
+    }
+  }
+  return closeBlock() ? substitutions : null;
+}
+
+// A PR whose whole diff replaces one version with another, in place, changes
+// nothing a reviewer could judge: what it releases was reviewed when it merged.
+// Returns that bump, or null when any file, hunk or line does more. Any
+// file-level change (added, removed, renamed) or a missing patch (binary, too
+// large) disqualifies, since the diff cannot be read in full.
+function versionOnlyRelease(files) {
+  const substitutions = new Set();
+  for (const file of files) {
+    if (file.status !== 'modified' || typeof file.patch !== 'string') return null;
+    const found = patchSubstitutions(file.patch);
+    if (found === null) return null;
+    found.forEach((s) => substitutions.add(s));
+  }
+  if (substitutions.size !== 1) return null;
+  const [from, to] = [...substitutions][0].split('\n');
+  return { from, to };
+}
+
 // Newest first, which is the order the API returns and `history` keeps.
 const newest = (history, context) => history.find((s) => s.context === context);
 
@@ -284,6 +359,18 @@ async function post({ github, core, owner, repo, pr, history, context, status })
 
 async function readStatuses({ github, owner, repo, pr }) {
   const head = pr.head.sha;
+  const files = await github.paginate(github.rest.pulls.listFiles, {
+    owner,
+    repo,
+    pull_number: pr.number,
+    per_page: 100,
+  });
+  const release = versionOnlyRelease(files);
+  if (release !== null) {
+    const status = { state: 'success', description: `version-only release: ${release.from} → ${release.to}` };
+    return { [CODEX_CONTEXT]: status, [INTERNAL_CONTEXT]: status };
+  }
+
   const comments = await github.paginate(github.rest.issues.listComments, {
     owner,
     repo,
@@ -433,4 +520,12 @@ async function run({ github, context, core }) {
   }
 }
 
-module.exports = { codexStatus, crashDescription, internalReviewStatus, postable, MAX_STATUS_DESCRIPTION, run };
+module.exports = {
+  codexStatus,
+  crashDescription,
+  internalReviewStatus,
+  postable,
+  versionOnlyRelease,
+  MAX_STATUS_DESCRIPTION,
+  run,
+};

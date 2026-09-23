@@ -580,6 +580,7 @@ function fakeGithub({
   events = [],
   statuses = [],
   suites = [suite(T0)],
+  files = [],
   failFor = [],
 }) {
   const posted = [];
@@ -592,6 +593,7 @@ function fakeGithub({
       },
       list: async () => ({ data: prs.filter((p) => p.state === 'open') }),
       listReviews: async () => ({ data: reviews }),
+      listFiles: async () => ({ data: files }),
     },
     issues: {
       listComments: async () => ({ data: commentsByCall[Math.min(reads++, commentsByCall.length - 1)] }),
@@ -959,4 +961,86 @@ test('run: the sweep evaluates every open PR and one failure does not starve the
   assert.match(log.failed[0], /#7/);
   assert.equal(log.errors.length, 1);
   assert.match(log.errors[0], /pr-gate\.test\.js/, 'the stack, not just the message');
+});
+
+// The shape of a real release PR: one version replaced by another, in place,
+// across several files and hunks.
+const modified = (filename, patch) => ({ filename, status: 'modified', patch });
+const RELEASE_FILES = [
+  modified(
+    'packages/validator/pyproject.toml',
+    '@@ -10,7 +10,7 @@ name = "validator"\n # kept equal\n-version = "1.0.0rc25"\n+version = "1.0.0rc26"\n description = "x"\n' +
+      '@@ -30,7 +30,7 @@ classifiers = [\n dependencies = [\n-    "contract-models==1.0.0rc25",\n+    "contract-models==1.0.0rc26",\n     "jsonschema>=4.0.0",\n',
+  ),
+  modified(
+    'agents/validator.md',
+    "@@ -46,8 +46,8 @@ on first use\n-{ check '1.0.0rc25' \\\n-  || pip install \"validator==1.0.0rc25\"; } \\\n+{ check '1.0.0rc26' \\\n+  || pip install \"validator==1.0.0rc26\"; } \\\n && run\n",
+  ),
+];
+const RELEASE = { from: '1.0.0rc25', to: '1.0.0rc26' };
+const withPatch = (patch) => [...RELEASE_FILES, modified('extra.py', patch)];
+
+test('versionOnlyRelease: one version replaced by another everywhere qualifies', () => {
+  assert.deepEqual(gate.versionOnlyRelease(RELEASE_FILES), RELEASE);
+});
+
+test('versionOnlyRelease: a line that keeps an unchanged version beside the bumped one still qualifies', () => {
+  assert.deepEqual(gate.versionOnlyRelease(withPatch('@@ -1 +1 @@\n-a = "2.0.0" b = "1.0.0rc25"\n+a = "2.0.0" b = "1.0.0rc26"\n')), RELEASE);
+});
+
+test('versionOnlyRelease: a PR with no files does not qualify', () => {
+  assert.equal(gate.versionOnlyRelease([]), null);
+});
+
+for (const status of ['added', 'removed', 'renamed', 'copied', 'changed']) {
+  test(`versionOnlyRelease: a ${status} file disqualifies`, () => {
+    assert.equal(gate.versionOnlyRelease([...RELEASE_FILES, { ...RELEASE_FILES[0], filename: 'x', status }]), null);
+  });
+}
+
+test('versionOnlyRelease: a file without a text patch (binary or too large) disqualifies', () => {
+  assert.equal(gate.versionOnlyRelease([...RELEASE_FILES, { filename: 'x.bin', status: 'modified' }]), null);
+});
+
+const DISQUALIFYING = {
+  'an added line with no removed partner': '@@ -1,1 +1,2 @@\n-v = "1.0.0rc25"\n+v = "1.0.0rc26"\n+evil()\n',
+  'a removed line with no added partner': '@@ -1,2 +1,1 @@\n-v = "1.0.0rc25"\n-guard()\n+v = "1.0.0rc26"\n',
+  'a removed line paired with an added line across context':
+    '@@ -1,3 +1,3 @@\n-v = "1.0.0rc25"\n guard()\n+v = "1.0.0rc26"\n',
+  'an edit beside the version': '@@ -1 +1 @@\n-v = "1.0.0rc25"  # a\n+v = "1.0.0rc26"  # b\n',
+  'a line changed without any version': '@@ -1 +1 @@\n-x = 1\n+x = 2\n',
+  'a second version pair': '@@ -1 +1 @@\n-dep==2.0.0\n+dep==2.0.1\n',
+  'a version going the other way': '@@ -1 +1 @@\n-v = "1.0.0rc26"\n+v = "1.0.0rc25"\n',
+  'a float constant, which is not a version': '@@ -1 +1 @@\n-threshold = 0.5\n+threshold = 0.6\n',
+  'a version that is only part of a longer token': '@@ -1 +1 @@\n-url = "1.0.0rc25x"\n+url = "1.0.0rc26x"\n',
+  'a no-newline marker': '@@ -1 +1 @@\n-v = "1.0.0rc25"\n\\ No newline at end of file\n+v = "1.0.0rc26"\n\\ No newline at end of file\n',
+};
+for (const [what, patch] of Object.entries(DISQUALIFYING)) {
+  test(`versionOnlyRelease: ${what} disqualifies`, () => {
+    assert.equal(gate.versionOnlyRelease(withPatch(patch)), null);
+  });
+}
+
+test('versionOnlyRelease: a line replaced by itself is not a bump', () => {
+  assert.equal(gate.versionOnlyRelease([modified('a', '@@ -1 +1 @@\n-v = "1.0.0"\n+v = "1.0.0"\n')]), null);
+});
+
+test('run: a version-only release PR passes both contexts without any review', async () => {
+  const { github, posted } = fakeGithub({ prs: [openPr()], commentsByCall: [[]], files: RELEASE_FILES });
+  await gate.run({ github, context: pushEvent, core: fakeCore().core });
+  const expected = 'version-only release: 1.0.0rc25 → 1.0.0rc26';
+  assert.deepEqual(
+    posted.map((s) => [s.context, s.state, s.description]),
+    [
+      ['codex-review', 'success', expected],
+      ['internal-review', 'success', expected],
+    ],
+  );
+});
+
+test('run: a release PR carrying any other change is gated like any PR', async () => {
+  const files = withPatch('@@ -1 +1 @@\n-x = 1\n+x = 2\n');
+  const { github, posted } = fakeGithub({ prs: [openPr()], commentsByCall: [[]], files });
+  await gate.run({ github, context: pushEvent, core: fakeCore().core });
+  assert.deepEqual(posted.map((s) => s.state), ['pending', 'pending']);
 });
