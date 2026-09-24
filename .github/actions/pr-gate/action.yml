@@ -1,0 +1,18 @@
+name: PR Gate
+description: Posts the codex-review and internal-review check runs on a PR's head (contracts/pr-gate-workflow.md).
+
+inputs:
+  token:
+    description: A short-lived token from the analitiq-pr-gate App, scoped to checks:write, pull-requests:read, issues:read, contents:read.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Evaluate
+      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+      with:
+        github-token: ${{ inputs.token }}
+        script: |
+          const gate = require(`${{ github.action_path }}/../../scripts/pr-gate.js`);
+          await gate.run({ github, context, core });
