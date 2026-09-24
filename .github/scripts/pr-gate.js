@@ -51,9 +51,12 @@ const ATTESTATION_MARKER = '<!-- analitiq-internal-review -->';
 // shell, where backticks are the first thing to get mangled.
 const ATTESTED_COMMIT = /\*{0,2}Reviewed commit:\*{0,2}\s*[`'"]?([0-9a-f]{10,40})/gi;
 
-// The only identity a consumer — and this script's own dedup — trusts
-// (contracts: gate-check-runs). A same-named run from any other actor is not
-// this gate's history.
+// This App's own slug. post() checks a freshly created run's response against
+// it, so a caller running this script with a token from the wrong App fails
+// loud instead of posting under a name a ruleset won't recognize; newestRun
+// uses it only as the gate's own re-post dedup (see the README's Limits
+// section for what actually stops a forged same-named run from another
+// actor).
 const GATE_APP_SLUG = 'analitiq-pr-gate';
 
 const MAX_TITLE_LENGTH = 255;
@@ -437,9 +440,8 @@ async function readRelease({ github, owner, repo, pr }) {
   return versionOnlyRelease({ files, read });
 }
 
-// The three states the gate's own logic ever returns (contracts:
-// gate-check-runs). `conclusion` is absent for `pending`: a run still
-// `in_progress` has none to report.
+// The three states the gate's own logic ever returns. `conclusion` is absent
+// for `pending`: a run still `in_progress` has none to report.
 const CHECK_RUN_STATE = {
   success: { status: 'completed', conclusion: 'success' },
   error: { status: 'completed', conclusion: 'failure' },
@@ -448,18 +450,20 @@ const CHECK_RUN_STATE = {
 
 // The App's own newest run of this name, or undefined. Check runs are not
 // returned newest-first the way commit statuses were, so they are compared by
-// when each started; a same-named run from another app is not this gate's
-// history at all.
+// when each started, with a tie broken by the higher id: GitHub hands out
+// check-run ids monotonically, so two runs sharing a started_at are still
+// ordered. A same-named run from another app is not this gate's history at
+// all.
 function newestRun(history, name) {
   return history
     .filter((run) => run.name === name && run.app?.slug === GATE_APP_SLUG)
-    .reduce(
-      (latest, run) =>
-        latest === undefined || timestamp(run.started_at, `check run ${run.id}`) > timestamp(latest.started_at, `check run ${latest.id}`)
-          ? run
-          : latest,
-      undefined,
-    );
+    .reduce((latest, run) => {
+      if (latest === undefined) return run;
+      const runAt = timestamp(run.started_at, `check run ${run.id}`);
+      const latestAt = timestamp(latest.started_at, `check run ${latest.id}`);
+      if (runAt !== latestAt) return runAt > latestAt ? run : latest;
+      return run.id > latest.id ? run : latest;
+    }, undefined);
 }
 
 async function post({ github, core, owner, repo, pr, history, name, status, runUrl }) {
@@ -473,7 +477,7 @@ async function post({ github, core, owner, repo, pr, history, name, status, runU
     core.info(`PR #${pr.number} @ ${short(pr.head.sha)}: ${name} already ${status.state}`);
     return;
   }
-  await github.rest.checks.create({
+  const { data } = await github.rest.checks.create({
     owner,
     repo,
     name,
@@ -482,6 +486,13 @@ async function post({ github, core, owner, repo, pr, history, name, status, runU
     output: { title, summary: status.description },
     ...run,
   });
+  // Whatever the token's owner meant to be, the run it just created belongs to
+  // whichever App the token actually authenticated as; a caller running this
+  // script with the wrong token would otherwise post a run silently ignored
+  // by any ruleset that requires the real App.
+  if (data.app?.slug !== GATE_APP_SLUG) {
+    throw new Error(`checks.create posted as '${data.app?.slug}', not the ${GATE_APP_SLUG} App`);
+  }
   core.info(`PR #${pr.number} @ ${short(pr.head.sha)}: ${name} -> ${status.state} (${title})`);
 }
 
@@ -585,9 +596,9 @@ async function evaluate({ github, core, owner, repo, prNumber, runUrl }) {
 
   let history = [];
   try {
-    // The App's own check runs on this head are the only history a consumer
-    // trusts (contracts: gate-check-runs); the trust filter lives in
-    // newestRun, next to the comparison it decides.
+    // The App's own check runs on this head are what newestRun compares
+    // against; the app.slug filter that keeps another actor's same-named run
+    // out of that comparison lives there, next to the comparison it decides.
     history = await github.paginate(github.rest.checks.listForRef, {
       owner,
       repo,
@@ -613,10 +624,11 @@ async function evaluate({ github, core, owner, repo, prNumber, runUrl }) {
   }
 }
 
-// The four events that run this workflow file from the default branch
-// (contracts: pr-gate-workflow.md). Anything else would run a branch's copy
-// of the caller with its write token; refusing here cannot prevent that, but
-// makes a consumer who wires such a trigger by mistake fail on the first run.
+// The four events that run this workflow file from the default branch (see
+// "Wiring it into a consumer repo" in the README). Anything else would run a
+// branch's copy of the caller with its write token; refusing here cannot
+// prevent that, but makes a consumer who wires such a trigger by mistake fail
+// on the first run.
 const ALLOWED_EVENTS = ['pull_request_target', 'issue_comment', 'schedule', 'repository_dispatch'];
 
 // Entry point for the shared composite action. The schedule's sweep is the

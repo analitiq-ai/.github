@@ -150,10 +150,11 @@ the structured verdict.
 
 Posts two check runs on the head of every open PR, signed by the
 `analitiq-pr-gate` GitHub App. Both are bound to the commit they name, so a
-push voids them without anyone revoking anything, and a consumer trusts a run
-only when its `app.slug` is `analitiq-pr-gate` — a same-named run from any
-other actor, App or workflow is not the gate's history and never suppresses a
-fresh post.
+push voids them without anyone revoking anything. A forged same-named run from
+another actor, App or workflow is rejected by the branch ruleset, which
+requires each check with `integration_id` set to the App (below); the gate's
+own `app.slug` filter only keeps such a run out of its re-post comparison, so
+it never suppresses a fresh post.
 
 | Check run | `success` (`completed`/`success`) when | Otherwise |
 |---|---|---|
@@ -398,11 +399,14 @@ confirm one gate run per repo, then delete the old key in the App settings.
 
 ### Limits
 
-- **A check run is only as trustworthy as the App token that posted it.**
-  `newestRun` trusts a run only when its `app.slug` is `analitiq-pr-gate`, so a
-  collaborator's own workflow cannot forge one under that name; it can still
-  post a check run under a different name, which a ruleset simply would not
-  require.
+- **A check run is only as trustworthy as the branch ruleset that requires
+  it.** The ruleset requires `codex-review` and `internal-review` with
+  `integration_id` set to the `analitiq-pr-gate` App, so a collaborator's own
+  workflow cannot forge either one under that name; it can still post a check
+  run under a different name, which the ruleset simply would not require.
+  `newestRun`'s `app.slug` filter is a separate, narrower thing: it is the
+  gate's own re-post dedup, so a same-named run from another actor is never
+  mistaken for one the gate already made and never suppresses a fresh post.
 - **The waiver trusts the shape of Codex's message.** A reply in which Codex is
   talked into reproducing the entire usage-limit message, and nothing else,
   would waive the review. If Codex rewords the message, nothing is waived

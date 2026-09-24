@@ -611,7 +611,7 @@ function fakeGithub({
       },
       create: async (run) => {
         created.push(run);
-        return { data: { id: 1000 + created.length } };
+        return { data: { id: 1000 + created.length, app: { slug: GATE_APP } } };
       },
     },
     repos: {
@@ -630,6 +630,12 @@ function fakeGithub({
       listCommitStatusesForRef: async ({ ref }) => {
         statusReads.push(ref);
         return { data: [] };
+      },
+      // Also never called any more; the `posted` array only exists so the
+      // `assert.deepEqual(posted, [])` guards below can fail if it ever is.
+      createCommitStatus: async (params) => {
+        posted.push(params);
+        return { data: {} };
       },
     },
   };
@@ -1271,7 +1277,7 @@ test('run: a release PR carrying any other change is gated like any PR', async (
 
 // ------------------------------------------------------------------ check runs
 
-// The slug every consumer trusts (contracts: gate-check-runs).
+// The App's own slug, matching GATE_APP_SLUG in pr-gate.js.
 const GATE_APP = 'analitiq-pr-gate';
 const checkRun = ({ id, at, name, status, conclusion, title, slug = GATE_APP }) => ({
   id,
@@ -1413,5 +1419,28 @@ test('run: an event that would run a branch\'s copy of the caller is refused bef
     const context = ctx(eventName, { pull_request: { number: 7, head: { sha: HEAD } } });
     await assert.rejects(gate.run({ github, context, core: fakeCore().core }), new RegExp(`\\b${eventName}\\b`), eventName);
     assert.deepEqual([posted, created, checkRunReads, statusReads], [[], [], [], []], eventName);
+  }
+});
+
+test('run: checks.create answering as a different App surfaces as an error naming that slug', async () => {
+  const { github, created } = fakeGithub({ prs: [openPr()], commentsByCall: [[comment(CODEX, CLEAN(HEAD), T1)]] });
+  github.rest.checks.create = async (run) => {
+    created.push(run);
+    return { data: { id: 1000 + created.length, app: { slug: 'some-imposter-app' } } };
+  };
+  await assert.rejects(gate.run({ github, context: pushEvent, core: fakeCore().core }), /some-imposter-app/);
+});
+
+test('check runs: two same-named runs with an equal started_at are tied by id, the higher one newest', async () => {
+  const lowerId = checkRun({ id: 1, at: T2, name: 'codex-review', status: 'in_progress', title: WAITING_CODEX });
+  const higherId = checkRun({ id: 2, at: T2, name: 'codex-review', status: 'completed', conclusion: 'success', title: CLEAN_DESCRIPTION });
+  for (const checkRuns of [[lowerId, higherId], [higherId, lowerId]]) {
+    const { github, created } = fakeGithub({ prs: [openPr()], commentsByCall: [[]], checkRuns });
+    await gate.run({ github, context: commentEvent, core: fakeCore().core });
+    assert.deepEqual(
+      verdicts(created).filter(([name]) => name === 'codex-review'),
+      [['codex-review', HEAD, 'in_progress', undefined, WAITING_CODEX]],
+      JSON.stringify(checkRuns.map((r) => r.id)),
+    );
   }
 });

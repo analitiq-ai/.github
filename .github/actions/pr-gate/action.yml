@@ -1,5 +1,5 @@
 name: PR Gate
-description: Posts the codex-review and internal-review check runs on a PR's head (contracts/pr-gate-workflow.md).
+description: Posts the codex-review and internal-review check runs on a PR's head.
 
 inputs:
   token:
