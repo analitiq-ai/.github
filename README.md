@@ -2,18 +2,19 @@
 
 Org-wide shared GitHub Actions tooling for `analitiq-ai` repositories.
 
-This repo hosts reusable workflows (`on: workflow_call`) and the scripts they
-depend on, so CI logic shared across repos is defined once and referenced
-from a thin caller workflow in each consuming repo, rather than copy-pasted.
+This repo hosts reusable workflows (`on: workflow_call`), composite actions,
+and the scripts they depend on, so CI logic shared across repos is defined
+once and referenced from a thin caller workflow in each consuming repo, rather
+than copy-pasted.
 
 ## Contents
 
 - `.github/workflows/ai-review.yml` — reusable workflow: an AI-generated code
   review posted as inline PR comments, triggered by a `/review` comment.
-- `.github/workflows/pr-gate.yml` — reusable workflow: posts the
-  `codex-review` and `internal-review` commit statuses on a PR's head, so a
-  ruleset can require them. Rules in `.github/scripts/pr-gate.js`, tests in
-  `tests/` (`node --test`).
+- `.github/actions/pr-gate` — composite action: posts the `codex-review` and
+  `internal-review` check runs on a PR's head, signed by the `analitiq-pr-gate`
+  GitHub App, so a ruleset can require them. Rules in
+  `.github/scripts/pr-gate.js`, tests in `tests/` (`node --test`).
 
 ## `ai-review.yml`
 
@@ -145,25 +146,30 @@ the structured verdict.
   it on live work.
 
 
-## `pr-gate.yml`
+## `pr-gate.yml` and the `pr-gate` action
 
-Posts two commit statuses on the head of every open PR. Both are bound to the
-commit they name, so a push voids them without anyone revoking anything.
+Posts two check runs on the head of every open PR, signed by the
+`analitiq-pr-gate` GitHub App. Both are bound to the commit they name, so a
+push voids them without anyone revoking anything, and a consumer trusts a run
+only when its `app.slug` is `analitiq-pr-gate` — a same-named run from any
+other actor, App or workflow is not the gate's history and never suppresses a
+fresh post.
 
-| Status | `success` when | Otherwise |
+| Check run | `success` (`completed`/`success`) when | Otherwise |
 |---|---|---|
-| `codex-review` | Codex's newest verdict on the head commit is clean: its clean template ("Codex Review: Didn't find any major issues") with no findings preamble, or a [👍 tied to the head](#the-codex-thumbs-up) — or no verdict is on the head and the [credit waiver](#the-codex-credit-waiver) applies | `pending` |
-| `internal-review` | a comment from `Analitiq-Bot` carries the attestation marker and names the head commit | `pending` |
+| `codex-review` | Codex's newest verdict on the head commit is clean: its clean template ("Codex Review: Didn't find any major issues") with no findings preamble, or a [👍 tied to the head](#the-codex-thumbs-up) — or no verdict is on the head and the [credit waiver](#the-codex-credit-waiver) applies | `in_progress`, titled with what is missing |
+| `internal-review` | a comment from `Analitiq-Bot` carries the attestation marker and names the head commit | `in_progress`, titled with what is missing |
 
-A [version-only release](#version-only-releases) passes both with `success`
-and needs neither review. A crash in the gate posts `error` on both, which
-still blocks a merge.
+A [version-only release](#version-only-releases) passes both with
+`completed`/`success` and needs neither review. A crash in the gate posts
+`completed`/`failure` on both, titled with the error, which still blocks a
+merge.
 
 ### Version-only releases
 
 A PR whose diff, read for exactly its head, only moves its package's own
-version up (and any pins of it with it) gets `success` on both statuses, and
-both read `version-only release: OLD → NEW`. It qualifies only if all of these
+version up (and any pins of it with it) gets `success` on both check runs, and
+both title `version-only release: OLD → NEW`. It qualifies only if all of these
 hold:
 
 - every file is modified, and GitHub returns its text patch (nothing added,
@@ -229,7 +235,7 @@ If the head was pushed after Codex's last out-of-credits answer and credits are
 still out, comment `@codex review`: Codex repeats the answer, now dated after
 the push.
 
-The status reads `WAIVED: Codex is out of credits; <sha> was not reviewed`, so
+The run titles `WAIVED: Codex is out of credits; <sha> was not reviewed`, so
 a skipped review is never mistaken for a passed one.
 
 If Codex says nothing at all, nothing is waived.
@@ -260,10 +266,10 @@ re-readies with no push in between. Once the head moves after the PR was first
 ready, only `@codex review` gets a verdict: Codex answers it with one naming
 the commit.
 
-A counted 👍 reads `Codex found no major issues in <sha> (thumbs-up on the
-PR)`, so it is never mistaken for a verdict naming the commit. A status
-description spells the reaction out because the API rejects a description
-carrying a character outside the BMP, which is what the reaction is.
+A counted 👍 titles `Codex found no major issues in <sha> (thumbs-up on the
+PR)`, so it is never mistaken for a verdict naming the commit. The title spells
+the reaction out in words rather than embedding the emoji itself, so it reads
+the same wherever a check run's title is rendered.
 
 A reaction triggers no workflow, so nothing re-runs the gate when the 👍
 arrives; the next event or scheduled sweep would. To have it counted now, send
@@ -277,10 +283,10 @@ gh api repos/<owner>/<repo>/dispatches -f event_type=pr-gate
 
 ### While no verdict names the head
 
-Unless the waiver applies, `codex-review` is pending, with the first
-description that applies:
+Unless the waiver applies, `codex-review` is `in_progress`, titled with the
+first line that applies:
 
-| When | Description |
+| When | Title |
 |---|---|
 | Codex shows 👀 | `Codex is reviewing; waiting for its verdict on <sha>` |
 | a Codex 👍, but the push cannot be dated | `Codex's thumbs-up is not counted: <sha> has no check suite to date its push` |
@@ -299,64 +305,92 @@ Whenever Codex answered, the run log also notes that no verdict names the head.
   all, so a 👍 after one can be an older review finishing.
 - **An `@codex review` comment as a request a 👍 answers.** Codex answers it
   with a verdict naming the commit, which counts on its own.
-- **A commit prefix under 10 hex digits**, in either status. Ten is what Codex
+- **A commit prefix under 10 hex digits**, in either check run. Ten is what Codex
   emits; accepting fewer would make it cheaper to craft a commit whose SHA
   collides with a stale verdict's prefix after a force-push.
 
 ### Wiring it into a consumer repo
 
-```yaml
-name: pr-gate
+The App key must be readable only by a job whose workflow file comes from the
+default branch. Only an environment with a branch policy gives that, and only
+a job in the key's own repo can declare that environment and read its secret
+without `secrets: inherit`. So the caller repo owns the job that mints the
+token; the shared `pr-gate` action receives it and nothing else.
 
-# Only events that run this file from the default branch. Never add
-# pull_request_review or workflow_dispatch: a review event executes the
-# workflow file from the PR merge ref, and a manual dispatch runs whichever ref
-# is selected, so either lets a PR that edits this file post its own success.
-# The reusable workflow refuses any other event. Verdicts delivered as PR
-# reviews are picked up by the sweep, which a repository_dispatch runs on
-# demand, e.g. once Codex gives its 👍.
+```yaml
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review]
   issue_comment:
-    types: [created, edited, deleted]
-  repository_dispatch:
   schedule:
-    - cron: "*/15 * * * *"
+  repository_dispatch:
+    types: [pr-gate]
 
-permissions:
-  contents: read
-  statuses: write
-  checks: read
-  pull-requests: read
-  issues: read
+permissions: {}
 
 jobs:
   gate:
-    # Comment events fire for every author; only these two can change a status.
-    if: >-
-      github.event_name != 'issue_comment' ||
-      (github.event.issue.pull_request &&
-       (github.event.comment.user.login == 'chatgpt-codex-connector[bot]' ||
-        github.event.comment.user.login == 'Analitiq-Bot'))
-    uses: analitiq-ai/.github/.github/workflows/pr-gate.yml@main
+    runs-on: ubuntu-latest
+    environment:
+      name: pr-gate
+      deployment: false
+    concurrency:
+      group: pr-gate-${{ github.event.pull_request.number || github.event.issue.number || 'sweep' }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@<full SHA> # vX.Y.Z
+        with:
+          client-id: ${{ vars.PR_GATE_CLIENT_ID }}
+          private-key: ${{ secrets.PR_GATE_APP_KEY }}
+          permission-checks: write
+          permission-pull-requests: read
+          permission-issues: read
+          permission-contents: read
+      - uses: analitiq-ai/.github/.github/actions/pr-gate@<full SHA>
+        with:
+          token: ${{ steps.token.outputs.token }}
 ```
 
-The `if:` is a cost gate, not a security boundary: a run only re-reads the PR
-and re-derives both statuses, whoever triggered it.
+- The job's triggers are `pull_request_target`, `issue_comment`, `schedule` and
+  `repository_dispatch`. Each runs the workflow file from the default branch.
+  `pull_request`, `push` and `workflow_dispatch` would run a branch's copy, and
+  the environment's branch policy refuses those; `run()` refuses them too, so a
+  caller wired to the wrong trigger fails its first run.
+- `environment.deployment: false` means no "deployed" entries on PRs; the
+  branch policy still applies.
+- `permissions: {}`: `GITHUB_TOKEN` gets nothing, and every API call the gate
+  makes uses the App token instead.
+- The `permission-*` list above is exactly what `pr-gate.js` calls: checks
+  write; pull-requests, issues and contents read.
+- There is no `actions/checkout`. The action is fetched by the runner, and PR
+  code is never on disk.
 
-Then require `codex-review` and `internal-review` in the branch ruleset.
+Then require `codex-review` and `internal-review` in the branch ruleset, each
+with `integration_id` set to the App's id (the id is not secret; it lives only
+in rulesets, never in a workflow).
 
-The gate script is always fetched from this repo's `main`, whatever ref the
-caller's `uses:` names, so a rule change reaches every consumer without each
-bumping a pin. Pinning `uses:` to a SHA pins the workflow file, not the rules.
+### Per-repo setup
+
+- Environment `pr-gate`:
+  - deployment branches: `main` only;
+  - secret `PR_GATE_APP_KEY`;
+  - variable `PR_GATE_CLIENT_ID`.
+- App installation: add the repo under "Only select repositories".
+- `CODEOWNERS`: `/.github/ @<owner>`. Ruleset: require code-owner review. This
+  stops a workflow that names the `pr-gate` environment from reaching `main`
+  without the owner.
+
+### Key rotation
+
+Generate a second key, update `PR_GATE_APP_KEY` in every repo's environment,
+confirm one gate run per repo, then delete the old key in the App settings.
 
 ### Limits
 
-- **A commit status is not proof of origin.** Anyone who can push a branch to
-  the consuming repo can add a workflow of their own that posts `codex-review`
-  with a write token. The gate stops mistakes and stale verdicts, not a
-  collaborator acting in bad faith; forks cannot do this.
+- **A check run is only as trustworthy as the App token that posted it.**
+  `newestRun` trusts a run only when its `app.slug` is `analitiq-pr-gate`, so a
+  collaborator's own workflow cannot forge one under that name; it can still
+  post a check run under a different name, which a ruleset simply would not
+  require.
 - **The waiver trusts the shape of Codex's message.** A reply in which Codex is
   talked into reproducing the entire usage-limit message, and nothing else,
   would waive the review. If Codex rewords the message, nothing is waived
@@ -371,13 +405,13 @@ bumping a pin. Pinning `uses:` to a SHA pins the workflow file, not the rules.
   marked ready, and Codex answers it with only a 👍 on the description, that
   👍 counts for the head. Codex normally answers that request with a verdict
   comment naming the commit, which voids the tie.
-- **A 👀 Codex leaves behind holds `codex-review` pending**, waiver included.
-  None has been seen left behind, including on PRs whose last Codex answer
-  was out of credits.
-- **Statuses belong to a commit, not a PR.** Two open PRs sharing a head SHA
-  overwrite each other's statuses.
+- **A 👀 Codex leaves behind holds `codex-review` in progress**, waiver
+  included. None has been seen left behind, including on PRs whose last Codex
+  answer was out of credits.
+- **Check runs belong to a commit, not a PR.** Two open PRs sharing a head SHA
+  share each other's check runs.
 - **A stale `success` is revoked by the next event or sweep, not instantly.**
   A deleted attestation, a dismissed review or a withdrawn 👍 takes effect
-  then. The sweep runs outside the per-PR concurrency group and statuses are
+  then. The sweep runs outside the per-PR concurrency group and runs are
   last-writer-wins; the gate re-reads before demoting, which narrows that race
   without closing it.
