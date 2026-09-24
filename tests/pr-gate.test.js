@@ -581,6 +581,7 @@ function fakeGithub({
   reactions = [],
   events = [],
   statuses = [],
+  checkRuns = [],
   suites = [suite(T0)],
   files = [],
   manifests = {},
@@ -588,6 +589,9 @@ function fakeGithub({
   failFor = [],
 }) {
   const posted = [];
+  const created = [];
+  const checkRunReads = [];
+  const statusReads = [];
   const compared = [];
   const read = [];
   let reads = 0;
@@ -609,6 +613,15 @@ function fakeGithub({
     },
     checks: {
       listSuitesForRef: async () => ({ data: { total_count: suites.length, check_suites: suites } }),
+      listForRef: async ({ ref, check_name }) => {
+        checkRunReads.push(ref);
+        const runs = checkRuns.filter((r) => check_name === undefined || r.name === check_name);
+        return { data: { total_count: runs.length, check_runs: runs } };
+      },
+      create: async (run) => {
+        created.push(run);
+        return { data: { id: 1000 + created.length } };
+      },
     },
     repos: {
       compareCommitsWithBasehead: async ({ basehead }) => {
@@ -623,7 +636,10 @@ function fakeGithub({
         return { data: { type: 'file', encoding: 'base64', content: Buffer.from(text).toString('base64') } };
       },
       // newest first, as the API returns them
-      listCommitStatusesForRef: async () => ({ data: statuses }),
+      listCommitStatusesForRef: async ({ ref }) => {
+        statusReads.push(ref);
+        return { data: statuses };
+      },
       createCommitStatus: async (s) => {
         // Nothing the API would reject reaches it, the crash description included.
         assertPostable(s.description, 'the posted description');
@@ -634,9 +650,9 @@ function fakeGithub({
   };
   const paginate = async (fn, params) => {
     const { data } = await fn(params);
-    return Array.isArray(data) ? data : data.check_suites;
+    return Array.isArray(data) ? data : (data.check_suites ?? data.check_runs);
   };
-  return { posted, compared, read, github: { rest, paginate } };
+  return { posted, created, checkRunReads, statusReads, compared, read, github: { rest, paginate } };
 }
 
 // What Octokit throws for a failed request: an error carrying the HTTP status.
@@ -667,9 +683,9 @@ const openPr = (number = 7) => ({
   updated_at: T3,
   draft: false,
 });
-const ctx = (payload) => ({ repo: { owner: 'o', repo: 'r' }, payload });
-const pushEvent = ctx({ pull_request: { number: 7, head: { sha: HEAD }, updated_at: T3 } });
-const commentEvent = ctx({ issue: { number: 7, pull_request: {} } });
+const ctx = (eventName, payload) => ({ eventName, repo: { owner: 'o', repo: 'r' }, payload });
+const pushEvent = ctx('pull_request_target', { pull_request: { number: 7, head: { sha: HEAD }, updated_at: T3 } });
+const commentEvent = ctx('issue_comment', { issue: { number: 7, pull_request: {} } });
 const status = (context, state, description, at) => ({ context, state, description, created_at: at });
 const suite = (at) => ({ created_at: at });
 const WAIVED_DESCRIPTION = `WAIVED: Codex is out of credits; ${HEAD10} was not reviewed`;
@@ -696,7 +712,7 @@ test('run: a comment on an open PR evaluates it', async () => {
 
 test('run: a comment on a plain issue is ignored', async () => {
   const { github, posted } = fakeGithub({ prs: [openPr()], commentsByCall: [[]] });
-  await gate.run({ github, context: ctx({ issue: { number: 7 } }), core: fakeCore().core });
+  await gate.run({ github, context: ctx('issue_comment', { issue: { number: 7 } }), core: fakeCore().core });
   assert.deepEqual(posted, []);
 });
 
@@ -790,7 +806,7 @@ test('run: a check suite without a valid date is an error, however many suites t
 });
 
 test('run: the waiver does not depend on which event, or which run, got there first', async () => {
-  for (const context of [pushEvent, commentEvent, ctx({})]) {
+  for (const context of [pushEvent, commentEvent, ctx('schedule', {})]) {
     const { github, posted } = fakeGithub({ prs: [openPr()], commentsByCall: [[comment(CODEX, LIMIT, T1)]] });
     await gate.run({ github, context, core: fakeCore().core });
     assert.equal(of(posted, 'codex-review')[0].description, WAIVED_DESCRIPTION);
@@ -823,7 +839,7 @@ test('run: a Codex 👍 is read from the description\'s reactions and tied by th
 
 test('run: a repository_dispatch, which names no PR, sweeps every open PR', async () => {
   // How whoever sees Codex's 👍 wakes the gate: a reaction triggers no workflow.
-  const dispatch = ctx({ action: 'pr-gate', branch: 'main', client_payload: {} });
+  const dispatch = ctx('repository_dispatch', { action: 'pr-gate', branch: 'main', client_payload: {} });
   const { github, posted } = fakeGithub({ prs: [openPr(7), openPr(8)], commentsByCall: [[]] });
   await gate.run({ github, context: dispatch, core: fakeCore().core });
   assert.equal(of(posted, 'codex-review').length, 2);
@@ -977,7 +993,7 @@ test('run: failing to post the error status does not mask the crash that caused 
 test('run: the sweep evaluates every open PR and one failure does not starve the rest', async () => {
   const { github, posted } = fakeGithub({ prs: [openPr(7), openPr(8)], commentsByCall: [[]], failFor: [7] });
   const { core, log } = fakeCore();
-  await gate.run({ github, context: ctx({}), core });
+  await gate.run({ github, context: ctx('schedule', {}), core });
   assert.ok(posted.length > 0, 'PR 8 was still evaluated');
   assert.equal(log.failed.length, 1);
   assert.match(log.failed[0], /#7/);
@@ -1247,4 +1263,151 @@ test('run: a release PR carrying any other change is gated like any PR', async (
   const { github, posted } = releaseRun({ prs: [{ ...openPr(), changed_files: files.length }], files });
   await gate.run({ github, context: pushEvent, core: fakeCore().core });
   assert.deepEqual(posted.map((s) => s.state), ['pending', 'pending']);
+});
+
+// ------------------------------------------------------------------ check runs
+
+// The slug every consumer trusts (contracts: gate-check-runs).
+const GATE_APP = 'analitiq-pr-gate';
+const checkRun = ({ id, at, name, status, conclusion, title, slug = GATE_APP }) => ({
+  id,
+  name,
+  head_sha: HEAD,
+  status,
+  conclusion: conclusion ?? null,
+  started_at: at,
+  output: { title },
+  app: { slug },
+});
+const INTERNAL_CLEAN = `Internal review clean on ${HEAD10}`;
+const WAITING_CODEX = `Waiting for a Codex review of ${HEAD10}`;
+// What a posted run says, by name, in the order of the contract's table columns.
+const verdicts = (created) =>
+  created
+    .map((r) => [r.name, r.head_sha, r.status, r.conclusion, r.output?.title])
+    .sort(([a], [b]) => a.localeCompare(b));
+const assertTitlesFit = (created) =>
+  created.forEach((r) => assert.ok(r.output.title.length <= 255, `title over 255 characters: ${r.output.title}`));
+
+test('check runs: a clean verdict is posted as a completed, successful run titled with the verdict', async () => {
+  const { github, created, posted } = fakeGithub({
+    prs: [openPr()],
+    commentsByCall: [[comment(CODEX, CLEAN(HEAD), T1), comment(BOT, ATTEST(HEAD), T1)]],
+  });
+  await gate.run({ github, context: pushEvent, core: fakeCore().core });
+  assert.deepEqual(verdicts(created), [
+    ['codex-review', HEAD, 'completed', 'success', CLEAN_DESCRIPTION],
+    ['internal-review', HEAD, 'completed', 'success', INTERNAL_CLEAN],
+  ]);
+  assertTitlesFit(created);
+  assert.deepEqual(posted, []);
+});
+
+test('check runs: a waiver is posted as a completed, successful run titled WAIVED', async () => {
+  const { github, created, posted } = fakeGithub({ prs: [openPr()], commentsByCall: [[comment(CODEX, LIMIT, T1)]] });
+  await gate.run({ github, context: commentEvent, core: fakeCore().core });
+  assert.deepEqual(verdicts(created).find(([name]) => name === 'codex-review'), [
+    'codex-review',
+    HEAD,
+    'completed',
+    'success',
+    WAIVED_DESCRIPTION,
+  ]);
+  assertTitlesFit(created);
+  assert.deepEqual(posted, []);
+});
+
+test('check runs: a version-only release is posted as completed, successful runs titled with the bump', async () => {
+  const { github, created, posted } = releaseRun();
+  await gate.run({ github, context: pushEvent, core: fakeCore().core });
+  const bump = 'version-only release: 1.0.0rc25 → 1.0.0rc26';
+  assert.deepEqual(verdicts(created), [
+    ['codex-review', HEAD, 'completed', 'success', bump],
+    ['internal-review', HEAD, 'completed', 'success', bump],
+  ]);
+  assert.deepEqual(posted, []);
+});
+
+test('check runs: a pending verdict is an in-progress run with no conclusion, titled with what is missing', async () => {
+  const { github, created, posted } = fakeGithub({ prs: [openPr()], commentsByCall: [[]] });
+  await gate.run({ github, context: pushEvent, core: fakeCore().core });
+  assert.deepEqual(verdicts(created), [
+    ['codex-review', HEAD, 'in_progress', undefined, WAITING_CODEX],
+    ['internal-review', HEAD, 'in_progress', undefined, WAITING_INTERNAL],
+  ]);
+  assertTitlesFit(created);
+  assert.deepEqual(posted, []);
+});
+
+test('check runs: a crash is a completed, failed run on both names, titled with the error and within 255 characters', async () => {
+  const { github, created, posted } = fakeGithub({ prs: [openPr()], commentsByCall: [[]] });
+  github.rest.pulls.listReviews = async () => {
+    throw new Error(`reviews API down ${'x'.repeat(400)}`);
+  };
+  await assert.rejects(gate.run({ github, context: pushEvent, core: fakeCore().core }), /reviews API down/);
+  assert.deepEqual(
+    verdicts(created).map(([name, sha, status, conclusion]) => [name, sha, status, conclusion]),
+    [
+      ['codex-review', HEAD, 'completed', 'failure'],
+      ['internal-review', HEAD, 'completed', 'failure'],
+    ],
+  );
+  assert.ok(created.every((r) => /reviews API down/.test(r.output.title)));
+  assertTitlesFit(created);
+  assert.deepEqual(posted, []);
+});
+
+test('check runs: the history compared against is the App\'s own runs on the head, never commit statuses', async () => {
+  const { github, created, checkRunReads, statusReads } = fakeGithub({
+    prs: [openPr()],
+    commentsByCall: [[comment(CODEX, CLEAN(HEAD), T1), comment(BOT, ATTEST(HEAD), T1)]],
+    checkRuns: [
+      checkRun({ id: 1, at: T2, name: 'codex-review', status: 'completed', conclusion: 'success', title: CLEAN_DESCRIPTION }),
+      checkRun({ id: 2, at: T2, name: 'internal-review', status: 'completed', conclusion: 'success', title: INTERNAL_CLEAN }),
+    ],
+  });
+  await gate.run({ github, context: pushEvent, core: fakeCore().core });
+  assert.deepEqual(created, [], 'an unchanged verdict is not re-posted');
+  assert.ok(checkRunReads.length > 0, 'the head\'s check runs were never read');
+  assert.ok(checkRunReads.every((ref) => ref === HEAD));
+  assert.deepEqual(statusReads, []);
+});
+
+test('check runs: a same-name run from another app is not the gate\'s history', async () => {
+  const { github, created } = fakeGithub({
+    prs: [openPr()],
+    commentsByCall: [[comment(CODEX, CLEAN(HEAD), T1), comment(BOT, ATTEST(HEAD), T1)]],
+    checkRuns: [
+      checkRun({ id: 1, at: T2, name: 'codex-review', status: 'completed', conclusion: 'success', title: CLEAN_DESCRIPTION, slug: 'github-actions' }),
+      checkRun({ id: 2, at: T2, name: 'internal-review', status: 'completed', conclusion: 'success', title: INTERNAL_CLEAN, slug: 'github-actions' }),
+    ],
+  });
+  await gate.run({ github, context: pushEvent, core: fakeCore().core });
+  assert.deepEqual(verdicts(created), [
+    ['codex-review', HEAD, 'completed', 'success', CLEAN_DESCRIPTION],
+    ['internal-review', HEAD, 'completed', 'success', INTERNAL_CLEAN],
+  ]);
+});
+
+test('check runs: the App\'s newest run of a name is the one compared against, whatever order they are listed in', async () => {
+  const older = checkRun({ id: 1, at: T0, name: 'codex-review', status: 'in_progress', title: WAITING_CODEX });
+  const newer = checkRun({ id: 2, at: T2, name: 'codex-review', status: 'completed', conclusion: 'success', title: CLEAN_DESCRIPTION });
+  for (const checkRuns of [[newer, older], [older, newer]]) {
+    const { github, created } = fakeGithub({ prs: [openPr()], commentsByCall: [[]], checkRuns });
+    await gate.run({ github, context: commentEvent, core: fakeCore().core });
+    assert.deepEqual(
+      verdicts(created).filter(([name]) => name === 'codex-review'),
+      [['codex-review', HEAD, 'in_progress', undefined, WAITING_CODEX]],
+      JSON.stringify(checkRuns.map((r) => r.id)),
+    );
+  }
+});
+
+test('run: an event that would run a branch\'s copy of the caller is refused before anything is read or posted', async () => {
+  for (const eventName of ['pull_request', 'push', 'workflow_dispatch', 'pull_request_review', 'pull_request_review_comment', 'workflow_run']) {
+    const { github, posted, created, checkRunReads, statusReads } = fakeGithub({ prs: [openPr()], commentsByCall: [[]] });
+    const context = ctx(eventName, { pull_request: { number: 7, head: { sha: HEAD } } });
+    await assert.rejects(gate.run({ github, context, core: fakeCore().core }), new RegExp(`\\b${eventName}\\b`), eventName);
+    assert.deepEqual([posted, created, checkRunReads, statusReads], [[], [], [], []], eventName);
+  }
 });
