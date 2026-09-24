@@ -13,6 +13,9 @@ runs:
       uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
       with:
         github-token: ${{ inputs.token }}
+        # A single 5xx from the API would otherwise turn two valid successes
+        # into failures until the next run.
+        retries: 3
         script: |
           const gate = require(`${{ github.action_path }}/../../scripts/pr-gate.js`);
           await gate.run({ github, context, core });

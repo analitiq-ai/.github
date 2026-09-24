@@ -320,15 +320,22 @@ token; the shared `pr-gate` action receives it and nothing else.
 ```yaml
 on:
   pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
   issue_comment:
-  schedule:
+    types: [created, edited, deleted]
   repository_dispatch:
-    types: [pr-gate]
+  schedule:
+    - cron: "*/15 * * * *"
 
 permissions: {}
 
 jobs:
   gate:
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request &&
+       (github.event.comment.user.login == 'chatgpt-codex-connector[bot]' ||
+        github.event.comment.user.login == 'Analitiq-Bot'))
     runs-on: ubuntu-latest
     environment:
       name: pr-gate
@@ -355,6 +362,11 @@ jobs:
   `pull_request`, `push` and `workflow_dispatch` would run a branch's copy, and
   the environment's branch policy refuses those; `run()` refuses them too, so a
   caller wired to the wrong trigger fails its first run.
+- `ready_for_review` re-runs the gate when a draft is marked ready, which is
+  when Codex reviews unasked.
+- The `if:` is a cost gate, not a security boundary: a run only re-reads the
+  PR, so a comment from anyone else could change nothing, but it would start a
+  runner and mint a token.
 - `environment.deployment: false` means no "deployed" entries on PRs; the
   branch policy still applies.
 - `permissions: {}`: `GITHUB_TOKEN` gets nothing, and every API call the gate
