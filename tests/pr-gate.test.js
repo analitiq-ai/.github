@@ -1291,7 +1291,7 @@ const checkRun = ({ id, at, name, status, conclusion, title, slug = GATE_APP }) 
 });
 const INTERNAL_CLEAN = `Internal review clean on ${HEAD10}`;
 const WAITING_CODEX = `Waiting for a Codex review of ${HEAD10}`;
-// What a posted run says, by name, in the order of the contract's table columns.
+// What a posted run says, as [name, head_sha, status, conclusion, title], sorted by name.
 const verdicts = (created) =>
   created
     .map((r) => [r.name, r.head_sha, r.status, r.conclusion, r.output?.title])
