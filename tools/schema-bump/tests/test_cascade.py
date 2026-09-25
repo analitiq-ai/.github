@@ -250,6 +250,30 @@ def test_a_dropped_connection_fails_loud(monkeypatch, outcome):
         cascade.openrouter_post("key", sleep=lambda _: None)(cascade.JEV_URL, {})
 
 
+class _BodyFailing(io.BytesIO):
+    def __init__(self, error: Exception):
+        super().__init__()
+        self.error = error
+
+    def read(self, *args):
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(TimeoutError("read timed out"), id="timeout"),
+        pytest.param(http.client.IncompleteRead(b"{"), id="truncated-body"),
+    ],
+)
+@pytest.mark.parametrize("code", [400, 503])
+def test_an_error_status_whose_body_cannot_be_read_fails_loud(monkeypatch, code, error):
+    failing = urllib.error.HTTPError("u", code, "m", {}, _BodyFailing(error))
+    _urlopen_answering(monkeypatch, [failing] * 4)
+    with pytest.raises(cascade.BumpClassificationError):
+        cascade.openrouter_post("key", sleep=lambda _: None)(cascade.JEV_URL, {})
+
+
 def test_a_success_status_with_a_body_that_is_not_json_fails_loud(monkeypatch):
     monkeypatch.setattr(cascade.urllib.request, "urlopen", lambda request, timeout: _Response(b"<html>"))
     with pytest.raises(cascade.BumpClassificationError):

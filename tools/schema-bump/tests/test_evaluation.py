@@ -127,6 +127,22 @@ def test_a_pair_labelled_twice_fails_at_load(history, tmp_path):
         evaluation.historical_cases(history, _labels(tmp_path, entry, {**entry, "label": "major"}))
 
 
+@pytest.mark.parametrize("labelled", [False, True], ids=["unlabelled", "labelled"])
+@pytest.mark.parametrize(
+    "root",
+    [
+        pytest.param(lambda history: history / "a", id="one-level-too-deep"),
+        pytest.param(lambda history: history / "b", id="single-version"),
+        pytest.param(lambda history: history.parent / "empty", id="empty"),
+    ],
+)
+def test_a_history_with_no_consecutive_pair_fails_at_load(history, tmp_path, root, labelled):
+    (history.parent / "empty").mkdir()
+    labels = _labels(tmp_path) if labelled else None
+    with pytest.raises(ValueError, match="history"):
+        evaluation.historical_cases(root(history), labels)
+
+
 def test_a_pair_with_nothing_to_classify_fails_at_load(history):
     _pinned(history, "b", "1.0.1", type="string")
     with pytest.raises(ValueError):

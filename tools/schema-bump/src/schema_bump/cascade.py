@@ -124,35 +124,39 @@ def openrouter_post(api_key: str, *, sleep: Callable[[float], None] = time.sleep
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             method="POST",
         )
-        attempt = 0
+        delays = iter(_RETRY_DELAYS)
         while True:
             try:
-                with urllib.request.urlopen(request, timeout=300) as response:
-                    status, raw = response.status, response.read()
-            except urllib.error.HTTPError as error:
-                if error.code not in _RETRY_STATUSES or attempt == len(_RETRY_DELAYS):
-                    return error.code, _error_body(error)
+                status, raw = _exchange(request)
             except (OSError, http.client.HTTPException) as error:
                 raise BumpClassificationError(f"cannot reach {url}: {error!r}") from error
-            else:
-                try:
-                    return status, json.loads(raw)
-                except json.JSONDecodeError as error:
-                    raise BumpClassificationError(
-                        f"{url} returned HTTP {status} with a body that is not JSON: {raw[:500]!r}"
-                    ) from error
-            sleep(_RETRY_DELAYS[attempt])
-            attempt += 1
+            delay = next(delays, None) if status in _RETRY_STATUSES else None
+            if delay is None:
+                return status, _body(url, status, raw)
+            sleep(delay)
 
     return post
 
 
-def _error_body(error: urllib.error.HTTPError) -> Any:
-    raw = error.read()
+def _exchange(request: urllib.request.Request) -> tuple[int, bytes]:
+    """One request's status and raw body. Every read of the socket happens here,
+    so the caller's one handler covers a failure in any of them."""
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as error:
+        return error.code, error.read()
+
+
+def _body(url: str, status: int, raw: bytes) -> Any:
     try:
         return json.loads(raw)
-    except json.JSONDecodeError:
-        return {"error": {"message": raw.decode("utf-8", "replace"), "code": error.code}}
+    except ValueError as error:
+        if status < 400:
+            raise BumpClassificationError(
+                f"{url} returned HTTP {status} with a body that is not JSON: {raw[:500]!r}"
+            ) from error
+        return {"error": {"message": raw.decode("utf-8", "replace"), "code": status}}
 
 
 def decide(resource: str, old: dict, new: dict, diff: str, post: Post) -> Decision:

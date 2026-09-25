@@ -22,7 +22,7 @@ from typing import Any, Callable
 from . import cascade
 from .diff import diff
 from .inputs import read_json_object
-from .semver import BUMPS, SEMVER_RE, bump_between, parse_semver
+from .semver import BUMPS, bump_between, is_semver, parse_semver
 from .synthetic import PAIRS as SYNTHETIC_PAIRS
 
 _RANK = {bump: rank for rank, bump in enumerate(reversed(BUMPS), start=1)}
@@ -45,14 +45,15 @@ def historical_cases(history: Path, labels_path: Path | None) -> list[Case]:
     paid run starts, and any defect raises ValueError: an unreadable or
     malformed file, a pair labelled twice, a label naming a pair that is not
     consecutive in the tree (so a stale label cannot silently stop applying),
-    and a scored pair with nothing to classify.
+    a scored pair with nothing to classify, and a tree holding no consecutive
+    pair at all (a `history` rooted at the wrong level).
     """
     labels = _load_labels(labels_path) if labels_path is not None else {}
     cases: list[Case] = []
     seen: set[tuple[str, str, str]] = set()
     for directory in sorted(p for p in history.iterdir() if p.is_dir()):
         versions = sorted(
-            (f.stem for f in directory.glob("*.json") if SEMVER_RE.match(f.stem)), key=parse_semver
+            (f.stem for f in directory.glob("*.json") if is_semver(f.stem)), key=parse_semver
         )
         for old_version, new_version in zip(versions, versions[1:]):
             key = (directory.name, old_version, new_version)
@@ -66,6 +67,8 @@ def historical_cases(history: Path, labels_path: Path | None) -> list[Case]:
             if not diff(old, new):
                 raise ValueError(f"{name} has nothing to classify; label it null")
             cases.append(Case("historical", name, old, new, label))
+    if not seen:
+        raise ValueError(f"the history {history} holds no consecutive pair of <resource>/X.Y.Z.json versions")
     stale = sorted(set(labels) - seen)
     if stale:
         raise ValueError(f"the labels file names pairs that are not consecutive pinned versions: {stale}")
