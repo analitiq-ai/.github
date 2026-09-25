@@ -178,8 +178,17 @@ def test_luna_reads_both_whole_schemas_without_their_stamps():
     }
 
 
-class _Response(io.BytesIO):
-    status = 200
+class _Body(io.BytesIO):
+    """A response body; `read` raises `failure` when one is given."""
+
+    def __init__(self, raw: bytes, status: int = 200, failure: Exception | None = None):
+        super().__init__(raw)
+        self.status, self.failure = status, failure
+
+    def read(self, *args):
+        if self.failure is not None:
+            raise self.failure
+        return super().read(*args)
 
     def __enter__(self):
         return self
@@ -188,93 +197,81 @@ class _Response(io.BytesIO):
         return False
 
 
-def _http_error(code: int, body: dict) -> urllib.error.HTTPError:
-    return urllib.error.HTTPError("u", code, "m", {}, io.BytesIO(json.dumps(body).encode()))
+def _ok(raw: bytes, failure: Exception | None = None):
+    return lambda: _Body(raw, failure=failure)
 
 
-def _urlopen_answering(monkeypatch, outcomes: list) -> list:
-    calls = []
+def _status(code: int, raw: bytes, failure: Exception | None = None):
+    def answer():
+        raise urllib.error.HTTPError("u", code, "m", {}, _Body(raw, code, failure))
+
+    return answer
+
+
+def _raises(error: Exception):
+    def answer():
+        raise error
+
+    return answer
+
+
+RAISES = object()
+JSON = json.dumps({"ok": True}).encode()
+OVERSIZED = json.dumps(_fixture("jev_oversized")).encode()
+TRIES = len(cascade._RETRY_DELAYS) + 1
+NOT_JSON = {"html": b"<html>", "not-utf8": b"\xff"}
+DROPPED = {
+    "timeout": TimeoutError("read timed out"),
+    "reset": ConnectionResetError(),
+    "truncated": http.client.IncompleteRead(b"{"),
+}
+
+
+def _wrapped(code: int, raw: bytes) -> dict:
+    return {"error": {"message": raw.decode("utf-8", "replace"), "code": code}}
+
+
+# Every row of the client's behaviour: the answers the server gives in order,
+# then what `post` returns (or RAISES, a BumpClassificationError) and how many
+# requests it made. A failure is raised by urlopen, by the body read, or by the
+# error body read; each surfaces the same way.
+TRANSPORT = [
+    pytest.param([_ok(JSON)], (200, {"ok": True}), 1, id="success"),
+    *(pytest.param([_ok(raw)], RAISES, 1, id=f"success-{name}") for name, raw in NOT_JSON.items()),
+    pytest.param([_status(429, b"{}"), _status(529, b"{}"), _ok(JSON)], (200, {"ok": True}), 3, id="retried"),
+    pytest.param([_status(503, JSON)] * TRIES, (503, {"ok": True}), TRIES, id="retries-exhausted"),
+    *(
+        pytest.param([_status(503, raw)] * TRIES, (503, _wrapped(503, raw)), TRIES, id=f"retries-exhausted-{name}")
+        for name, raw in NOT_JSON.items()
+    ),
+    pytest.param([_status(400, OVERSIZED)], (400, _fixture("jev_oversized")), 1, id="client-error"),
+    *(pytest.param([_status(400, raw)], (400, _wrapped(400, raw)), 1, id=f"client-error-{name}") for name, raw in NOT_JSON.items()),
+    pytest.param([_raises(urllib.error.URLError("no route"))], RAISES, 1, id="unreachable"),
+    *(pytest.param([_raises(error)], RAISES, 1, id=f"connect-{name}") for name, error in DROPPED.items()),
+    *(pytest.param([_ok(JSON, error)], RAISES, 1, id=f"read-{name}") for name, error in DROPPED.items()),
+    *(
+        pytest.param([_status(code, JSON, error)], RAISES, 1, id=f"error-read-{code}-{name}")
+        for code in (400, 503)
+        for name, error in DROPPED.items()
+    ),
+]
+
+
+@pytest.mark.parametrize(("answers", "outcome", "requests"), TRANSPORT)
+def test_the_client(monkeypatch, answers, outcome, requests):
+    calls, slept = [], []
 
     def urlopen(request, timeout):
         calls.append(request)
-        outcome = outcomes.pop(0)
-        if isinstance(outcome, Exception):
-            raise outcome
-        return _Response(json.dumps(outcome).encode())
+        return answers[len(calls) - 1]()
 
     monkeypatch.setattr(cascade.urllib.request, "urlopen", urlopen)
-    return calls
-
-
-def test_the_client_retries_rate_limits_and_server_errors(monkeypatch):
-    calls = _urlopen_answering(monkeypatch, [_http_error(429, {}), _http_error(529, {}), {"ok": True}])
-    slept: list[float] = []
-    status, body = cascade.openrouter_post("key", sleep=slept.append)(cascade.JEV_URL, {})
-    assert (status, body) == (200, {"ok": True})
-    assert len(calls) == 3 and len(slept) == 2
-    assert calls[0].get_header("Authorization") == "Bearer key"
-
-
-def test_the_client_returns_the_error_once_retries_run_out(monkeypatch):
-    errors = [_http_error(503, {"error": {"code": 503}}) for _ in range(10)]
-    calls = _urlopen_answering(monkeypatch, errors)
-    status, body = cascade.openrouter_post("key", sleep=lambda _: None)(cascade.JEV_URL, {})
-    assert (status, body) == (503, {"error": {"code": 503}})
-    assert len(calls) == 4
-
-
-def test_the_client_does_not_retry_a_client_error(monkeypatch):
-    calls = _urlopen_answering(monkeypatch, [_http_error(400, _fixture("jev_oversized"))])
-    status, body = cascade.openrouter_post("key", sleep=lambda _: None)(cascade.JEV_URL, {})
-    assert (status, body) == (400, _fixture("jev_oversized"))
-    assert len(calls) == 1
-
-
-def test_an_unreachable_host_fails_loud(monkeypatch):
-    _urlopen_answering(monkeypatch, [urllib.error.URLError("no route")])
-    with pytest.raises(cascade.BumpClassificationError):
-        cascade.openrouter_post("key", sleep=lambda _: None)(cascade.JEV_URL, {})
-
-
-@pytest.mark.parametrize(
-    "outcome",
-    [
-        pytest.param(TimeoutError("read timed out"), id="timeout"),
-        pytest.param(ConnectionResetError(), id="reset"),
-        pytest.param(http.client.IncompleteRead(b"{"), id="truncated-body"),
-    ],
-)
-def test_a_dropped_connection_fails_loud(monkeypatch, outcome):
-    _urlopen_answering(monkeypatch, [outcome])
-    with pytest.raises(cascade.BumpClassificationError):
-        cascade.openrouter_post("key", sleep=lambda _: None)(cascade.JEV_URL, {})
-
-
-class _BodyFailing(io.BytesIO):
-    def __init__(self, error: Exception):
-        super().__init__()
-        self.error = error
-
-    def read(self, *args):
-        raise self.error
-
-
-@pytest.mark.parametrize(
-    "error",
-    [
-        pytest.param(TimeoutError("read timed out"), id="timeout"),
-        pytest.param(http.client.IncompleteRead(b"{"), id="truncated-body"),
-    ],
-)
-@pytest.mark.parametrize("code", [400, 503])
-def test_an_error_status_whose_body_cannot_be_read_fails_loud(monkeypatch, code, error):
-    failing = urllib.error.HTTPError("u", code, "m", {}, _BodyFailing(error))
-    _urlopen_answering(monkeypatch, [failing] * 4)
-    with pytest.raises(cascade.BumpClassificationError):
-        cascade.openrouter_post("key", sleep=lambda _: None)(cascade.JEV_URL, {})
-
-
-def test_a_success_status_with_a_body_that_is_not_json_fails_loud(monkeypatch):
-    monkeypatch.setattr(cascade.urllib.request, "urlopen", lambda request, timeout: _Response(b"<html>"))
-    with pytest.raises(cascade.BumpClassificationError):
-        cascade.openrouter_post("key", sleep=lambda _: None)(cascade.JEV_URL, {})
+    post = cascade.openrouter_post("key", sleep=slept.append)
+    if outcome is RAISES:
+        with pytest.raises(cascade.BumpClassificationError):
+            post(cascade.JEV_URL, {})
+    else:
+        assert post(cascade.JEV_URL, {}) == outcome
+    assert len(calls) == requests
+    assert len(slept) == requests - 1
+    assert all(call.get_header("Authorization") == "Bearer key" for call in calls)
