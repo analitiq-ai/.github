@@ -1,0 +1,14 @@
+{
+  "id": "gen-fixture",
+  "model": "openai/gpt-6-luna-20260801",
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "{\"reasoning\":\"A name was added to required, so a document without it is now rejected.\",\"bump\":\"major\"}"
+      }
+    }
+  ],
+  "usage": {"prompt_tokens": 2210, "completion_tokens": 64, "cost": 0.00091}
+}

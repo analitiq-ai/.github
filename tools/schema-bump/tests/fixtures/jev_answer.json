@@ -1,0 +1,12 @@
+{
+  "id": "dec_fixture",
+  "model": "typesafe/jev-1.13-20260917",
+  "answers": {
+    "bump": {
+      "choice": "minor",
+      "confidence": 0.93,
+      "probabilities": {"major": 0.05, "minor": 0.93, "patch": 0.02}
+    }
+  },
+  "usage": {"prompt_tokens": 412, "completion_tokens": 0, "cost": 0.0000173}
+}

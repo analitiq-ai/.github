@@ -1,0 +1,134 @@
+name: Schema release (reusable)
+
+# Runs a caller's release command on its default branch and keeps one release
+# PR open with whatever it wrote: new pinned schema versions and their bump
+# records. The release command decides each bump with `schema-bump decide`
+# (tools/schema-bump), which calls the models, so this is the job the
+# OpenRouter key is meant for. A caller's PR CI verifies the committed records
+# offline with `schema-bump verify`. The caller contract is in the README's
+# `schema-release.yml` section.
+
+on:
+  workflow_call:
+    inputs:
+      setup-command:
+        description: Installs the caller's dependencies, including the schema-bump version it pins.
+        type: string
+        required: true
+      release-command:
+        description: Renders every schema and writes the new versions and bump records.
+        type: string
+        required: true
+      python-version:
+        type: string
+        default: "3.12"
+      release-branch:
+        type: string
+        default: schema-release
+      commit-message:
+        description: Commit message and PR title of the release.
+        type: string
+        default: "chore(schemas): release schema versions"
+      committer-name:
+        type: string
+        default: Analitiq-bot
+      committer-email:
+        type: string
+        default: analitiq@analitiq.ai
+    secrets:
+      OPEN_ROUTER_KEY:
+        required: true
+      # A token that can push the release branch and open a PR. A PR opened
+      # with GITHUB_TOKEN triggers no workflows, so the release PR's own CI —
+      # which verifies the records — would never run.
+      RELEASE_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # Queued, not cancelled: a run cancelled mid-classification has already
+    # paid for its model calls. Each run releases the default branch's head,
+    # so a queued run supersedes an older one's PR.
+    concurrency:
+      group: schema-release-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      # A dispatch runs the caller file from whichever ref is selected, so the
+      # rule is re-asserted here rather than left to each caller's trigger.
+      - name: Refuse anything but a push to, or a dispatch on, the default branch
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          case "$EVENT" in
+            push|workflow_dispatch) ;;
+            *) echo "::error::schema-release must not be triggered by '$EVENT'"; exit 1 ;;
+          esac
+          if [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            echo "::error::schema-release runs only on $DEFAULT_BRANCH, not $REF"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Set up
+        env:
+          SETUP_COMMAND: ${{ inputs.setup-command }}
+        run: bash -euo pipefail -c "$SETUP_COMMAND"
+
+      - name: Release
+        env:
+          RELEASE_COMMAND: ${{ inputs.release-command }}
+          OPENROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_KEY }}
+        run: bash -euo pipefail -c "$RELEASE_COMMAND" 2>&1 | tee "$RUNNER_TEMP/release.log"
+
+      - name: Open, update or close the release PR
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          BRANCH: ${{ inputs.release-branch }}
+          BASE: ${{ github.event.repository.default_branch }}
+          MESSAGE: ${{ inputs.commit-message }}
+          NAME: ${{ inputs.committer-name }}
+          EMAIL: ${{ inputs.committer-email }}
+          RELEASE_COMMAND: ${{ inputs.release-command }}
+        run: |
+          git add -A
+          open=$(gh pr list --head "$BRANCH" --base "$BASE" --state open --json number --jq '.[0].number // empty')
+          if git diff --cached --quiet; then
+            if [ -n "$open" ]; then
+              gh pr close "$open" --delete-branch --comment "$BASE has nothing left to release."
+            fi
+            echo "Nothing to release."
+            exit 0
+          fi
+          git -c user.name="$NAME" -c user.email="$EMAIL" commit -q -m "$MESSAGE"
+          git push --force origin "HEAD:refs/heads/$BRANCH"
+          {
+            echo "Written by \`$RELEASE_COMMAND\` from $BASE at $(git rev-parse HEAD~1)."
+            echo "Every bump record in this PR is verified offline by the PR's CI."
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/release.log"
+            echo '```'
+          } > "$RUNNER_TEMP/body.md"
+          if [ -n "$open" ]; then
+            gh pr edit "$open" --title "$MESSAGE" --body-file "$RUNNER_TEMP/body.md"
+          else
+            gh pr create --head "$BRANCH" --base "$BASE" --title "$MESSAGE" --body-file "$RUNNER_TEMP/body.md"
+          fi

@@ -15,6 +15,10 @@ than copy-pasted.
   `internal-review` check runs on a PR's head, signed by the `analitiq-pr-gate`
   GitHub App, so a ruleset can require them. Rules in
   `.github/scripts/pr-gate.js`, tests in `tests/` (`node --test`).
+- `.github/workflows/schema-release.yml` and `schema-bump-eval.yml` — reusable
+  workflows that release versioned JSON Schemas with model-decided semver
+  bumps, and evaluate those decisions. The decision logic is the
+  `tools/schema-bump` Python package (`schema-bump` CLI), tests beside it.
 
 ## `ai-review.yml`
 
@@ -431,3 +435,125 @@ confirm one gate run per repo, then delete the old key in the App settings.
   then. The sweep runs outside the per-PR concurrency group and runs are
   last-writer-wins; the gate re-reads before demoting, which narrows that race
   without closing it.
+
+## `schema-release.yml` and `tools/schema-bump`
+
+A repo that publishes versioned JSON Schemas needs the semver bump of every
+changed schema decided. `schema-bump` decides it with a model cascade, and
+records the decision so CI can check it with no network call and no secret.
+
+- **Stage 1**: Jev classifies a unified diff of the two schemas, printed with
+  sorted keys and without `$id`/`version`.
+- **Stage 2**: below the confidence floor, or when the diff is too large for
+  Jev, GPT-6 Luna classifies the diff together with both whole schemas.
+- Any other failure stops the release. There is no fallback bump.
+
+The model pins, the floor and the prompt texts live in
+`tools/schema-bump/src/schema_bump/cascade.py`. Changing any of them means
+re-running the evaluation (below) before a caller adopts the new version.
+
+### The caller contract
+
+The caller owns rendering, file layout and the `$id`/`version` stamps. The tool
+never learns a repo's layout.
+
+- **Pin one SHA of this repo** for both the tool and the workflows. The
+  setup installs the tool at it:
+  `analitiq-schema-bump @ git+https://github.com/analitiq-ai/.github@<sha>#subdirectory=tools/schema-bump`,
+  and every `uses:` line names the same `<sha>`, so a workflow never runs a
+  tool it was not written for. GitHub does not expand expressions in `uses:`,
+  so the SHA is repeated there literally; the caller's CI should fail when
+  the copies differ. Import the tool (`schema_bump.record.decide_record` / `record_problem`), or call
+  the `schema-bump` CLI.
+- **The release command** renders every schema. For each one whose diff
+  against its latest published version is not empty, it decides the bump and
+  writes the new pinned version and its bump record. A human override
+  (`--bump` with a `--reason`) must be committed alongside the change that
+  needs it, because every push to the default branch re-runs the release from
+  scratch.
+- **Only the release PR publishes.** The caller's PR CI fails a PR from any
+  other branch that changes pinned versions or bump records, and verifies
+  every record the release PR adds (`schema-bump verify`). The diff format is
+  part of the record contract, since a record pins its diff by sha256. A tool
+  release that changes the format is breaking: records written before it no
+  longer verify.
+
+### Wiring it into a consumer repo
+
+```yaml
+name: schema-release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    uses: analitiq-ai/.github/.github/workflows/schema-release.yml@<sha>
+    with:
+      setup-command: pip install -r requirements-dev.txt
+      release-command: python scripts/render_schemas.py release
+    secrets:
+      OPEN_ROUTER_KEY: ${{ secrets.OPEN_ROUTER_KEY }}
+      RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+```
+
+The workflow refuses any event but `push` and `workflow_dispatch`, and any ref
+but the default branch. It releases the default branch's head, and one release
+runs per repo at a time.
+
+A path filter is optional. A push that changes no schema produces empty diffs
+and makes no model call, so it costs only a render. A `paths:` filter saves
+runner minutes, but it must list every input the renderer reads, or a schema
+change waits until the next push that passes the filter.
+
+`RELEASE_TOKEN` pushes the release branch and opens the PR. A PR opened with
+`GITHUB_TOKEN` triggers no workflows, so the release PR's CI would never run.
+
+### Evaluation
+
+```yaml
+name: schema-bump-eval
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  eval:
+    uses: analitiq-ai/.github/.github/workflows/schema-bump-eval.yml@<sha>
+    with:
+      setup-command: pip install -r requirements-dev.txt
+      history: schemas
+      labels: evals/schema_bumps/labels.json
+    secrets:
+      OPEN_ROUTER_KEY: ${{ secrets.OPEN_ROUTER_KEY }}
+```
+
+The evaluation runs the cascade `runs` times over two sets of schema pairs:
+
+- the synthetic pairs in `tools/schema-bump`, each with a known bump;
+- every consecutive pair of versions under `history`. Each is labelled with
+  the bump it was published with, unless the labels file relabels it or, with
+  a null label, leaves it out. The `historical_cases` docstring in
+  `tools/schema-bump/src/schema_bump/evaluation.py` states the file's format.
+
+It fails on any under-bump, or on any stage-1 miss at or above the confidence
+floor. Results are uploaded as the `schema-bump-eval` artifact. It is paid, so
+it runs on dispatch only, from any ref: a change to the tool pin is evaluated
+on its branch before it merges.
+
+### Limits
+
+- **The OpenRouter key is an org secret.** Any workflow on any branch of a
+  repo the secret is shared with can read it, so anyone who can push a
+  branch there can spend it. Keep a spend cap on the key.
+- **A record proves consistency, not origin.** A hand-written record whose
+  stages, final bump and diff digest agree still verifies. It shows up in the
+  release PR's diff, and reviewing that diff is what catches it.
