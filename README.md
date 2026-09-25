@@ -392,11 +392,10 @@ A repo that publishes versioned JSON Schemas needs the semver bump of every
 changed schema decided. `schema-bump` decides it with a model cascade, and
 records the decision so CI can check it with no network call and no secret.
 
-- **Stage 1**: Jev (`typesafe/jev-1.13`) classifies a unified diff of the two
-  schemas, printed with sorted keys and without `$id`/`version`.
-- **Stage 2**: below a confidence of 0.7, or when the diff is too large for
-  Jev, GPT-6 Luna (`openai/gpt-6-luna`) classifies the diff together with both
-  whole schemas.
+- **Stage 1**: Jev classifies a unified diff of the two schemas, printed with
+  sorted keys and without `$id`/`version`.
+- **Stage 2**: below the confidence floor, or when the diff is too large for
+  Jev, GPT-6 Luna classifies the diff together with both whole schemas.
 - Any other failure stops the release. There is no fallback bump.
 
 The model pins, the floor and the prompt texts live in

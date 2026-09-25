@@ -8,7 +8,7 @@
         1 when it does not. Offline.
     schema-bump eval [--history DIR [--labels FILE]] [--runs N] [--workers N] [--out FILE]
         Run the evaluation. Paid; needs OPENROUTER_API_KEY. Exit 1 when the
-        acceptance bars fail.
+        acceptance bars fail, 2 on any other failure.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from typing import Any
 
 from . import cascade, evaluation
 from .record import NoChange, decide_record, record_problem
-from .semver import BUMPS
+from .semver import BUMPS, parse_semver
 
 
 def _positive_int(text: str) -> int:
@@ -29,6 +29,28 @@ def _positive_int(text: str) -> int:
     if value < 1:
         raise argparse.ArgumentTypeError(f"must be at least 1, got {value}")
     return value
+
+
+def _semver(text: str) -> str:
+    try:
+        parse_semver(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+    return text
+
+
+def _directory(text: str) -> Path:
+    path = Path(text)
+    if not path.is_dir():
+        raise argparse.ArgumentTypeError(f"{text}: not a directory")
+    return path
+
+
+def _file(text: str) -> Path:
+    path = Path(text)
+    if not path.is_file():
+        raise argparse.ArgumentTypeError(f"{text}: not a file")
+    return path
 
 
 def _json_object(text: str) -> dict:
@@ -88,9 +110,13 @@ def _eval(args: argparse.Namespace) -> int:
     if not api_key:
         return 2
     cases = evaluation.synthetic_cases()
-    if args.history is not None:
-        cases = evaluation.historical_cases(args.history, args.labels) + cases
-    ok, results = evaluation.run(cases, cascade.openrouter_post(api_key), args.runs, args.workers)
+    try:
+        if args.history is not None:
+            cases = evaluation.historical_cases(args.history, args.labels) + cases
+        ok, results = evaluation.run(cases, cascade.openrouter_post(api_key), args.runs, args.workers)
+    except (ValueError, cascade.BumpClassificationError) as error:
+        print(f"the evaluation stopped: {error}", file=sys.stderr)
+        return 2
     if args.out:
         args.out.write_text(json.dumps(results, indent=2) + "\n")
     return 0 if ok else 1
@@ -102,7 +128,7 @@ def main(argv: list[str] | None = None) -> int:
 
     decide = sub.add_parser("decide", help="classify a change and print its bump record")
     decide.add_argument("--resource", required=True)
-    decide.add_argument("--from-version", required=True)
+    decide.add_argument("--from-version", required=True, type=_semver)
     decide.add_argument("--old", required=True, type=_json_object)
     decide.add_argument("--new", required=True, type=_json_object)
     decide.add_argument("--bump", choices=BUMPS, help="override the models, in either direction; needs --reason")
@@ -112,15 +138,15 @@ def main(argv: list[str] | None = None) -> int:
     verify = sub.add_parser("verify", help="check a bump record against the schemas it publishes")
     verify.add_argument("--record", required=True, type=_json_object)
     verify.add_argument("--resource", required=True)
-    verify.add_argument("--from-version", required=True)
-    verify.add_argument("--to-version", required=True)
+    verify.add_argument("--from-version", required=True, type=_semver)
+    verify.add_argument("--to-version", required=True, type=_semver)
     verify.add_argument("--old", required=True, type=_json_object)
     verify.add_argument("--new", required=True, type=_json_object)
     verify.set_defaults(func=_verify)
 
     run = sub.add_parser("eval", help="measure the cascade against the labelled corpora (paid)")
-    run.add_argument("--history", type=Path, help="a tree of <resource>/X.Y.Z.json pinned versions")
-    run.add_argument("--labels", type=Path, help="labels overriding the published bump of historical pairs")
+    run.add_argument("--history", type=_directory, help="a tree of <resource>/X.Y.Z.json pinned versions")
+    run.add_argument("--labels", type=_file, help="labels overriding the published bump of historical pairs")
     run.add_argument("--runs", type=_positive_int, default=3)
     run.add_argument("--workers", type=_positive_int, default=8)
     run.add_argument("--out", type=Path, help="write every scored result as JSON here")

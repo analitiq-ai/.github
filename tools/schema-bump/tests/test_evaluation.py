@@ -67,6 +67,39 @@ def test_a_label_for_a_pair_that_is_not_consecutive_fails(history, tmp_path):
         evaluation.historical_cases(history, labels)
 
 
+@pytest.mark.parametrize(
+    "entry",
+    [
+        pytest.param({"resource": "a", "from": "1.0.0", "to": "1.1.0", "label": "huge"}, id="label-outside-bumps"),
+        pytest.param({"resource": "a", "from": "1.0.0", "to": "1.1.0"}, id="no-label"),
+        pytest.param({"resource": "a", "from": "1.0.0", "to": "1.1.0", "label": "minor", "x": 1}, id="extra-key"),
+    ],
+)
+def test_a_malformed_label_fails_at_load(history, tmp_path, entry):
+    with pytest.raises(ValueError):
+        evaluation.historical_cases(history, _labels(tmp_path, entry))
+
+
+@pytest.mark.parametrize("document", [{}, {"pairs": {}}, []])
+def test_a_labels_file_without_a_pairs_list_fails_at_load(history, tmp_path, document):
+    path = tmp_path / "labels.json"
+    path.write_text(json.dumps(document))
+    with pytest.raises(ValueError):
+        evaluation.historical_cases(history, path)
+
+
+def test_a_pair_labelled_twice_fails_at_load(history, tmp_path):
+    entry = {"resource": "a", "from": "1.0.0", "to": "1.1.0", "label": "minor"}
+    with pytest.raises(ValueError):
+        evaluation.historical_cases(history, _labels(tmp_path, entry, {**entry, "label": "major"}))
+
+
+def test_a_pair_with_nothing_to_classify_fails_at_load(history):
+    _pinned(history, "b", "1.0.1", type="string")
+    with pytest.raises(ValueError):
+        evaluation.historical_cases(history, None)
+
+
 def _answering(jev_confidence: float):
     luna = {
         "model": "l", "usage": {"cost": 0},
@@ -92,6 +125,13 @@ def test_a_stage1_miss_counts_against_the_floor_only_when_stage1_was_final(confi
 def test_a_run_fails_on_an_under_bump(final, passes):
     row = {"corpus": "c", "name": "n", "label": "major", "final": final, "stage1": {"skipped": "x"},
            "escalated": True, "cost": 0, "stage1_confident_miss": False}
+    assert evaluation.report(1, [row], out=lambda line: None) is passes
+
+
+@pytest.mark.parametrize(("confident_miss", "passes"), [(False, True), (True, False)])
+def test_a_run_fails_on_a_stage1_miss_at_or_above_the_floor(confident_miss, passes):
+    row = {"corpus": "c", "name": "n", "label": "minor", "final": "major", "stage1": {"confidence": 0.9},
+           "escalated": False, "cost": 0, "stage1_confident_miss": confident_miss}
     assert evaluation.report(1, [row], out=lambda line: None) is passes
 
 

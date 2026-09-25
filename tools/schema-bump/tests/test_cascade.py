@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import io
 import json
+import http.client
 import urllib.error
 from pathlib import Path
 
@@ -122,6 +123,8 @@ def _content(text):
         pytest.param((200, _luna_with(_content('{"bump":"major"}'))), id="no-reasoning"),
         pytest.param((200, _luna_with(_content('["major"]'))), id="not-an-object"),
         pytest.param((200, _luna_with(lambda b: b.pop("choices"))), id="no-choices"),
+        pytest.param((200, _luna_with(lambda b: b["usage"].__setitem__("cost", "0.01"))), id="cost-not-a-number"),
+        pytest.param((200, _luna_with(lambda b: b["usage"].__setitem__("cost", True))), id="cost-a-bool"),
     ],
 )
 def test_a_malformed_luna_answer_fails_loud(luna):
@@ -146,6 +149,7 @@ def test_a_malformed_luna_answer_fails_loud(luna):
                 "choice": "minor", "confidence": 1.5, "probabilities": {}}}, "usage": {"cost": 0}}),
             id="confidence-out-of-range",
         ),
+        pytest.param((200, {**_jev(0.9), "usage": {"cost": None}}), id="cost-not-a-number"),
     ],
 )
 def test_a_failed_jev_call_fails_loud(jev):
@@ -232,7 +236,11 @@ def test_an_unreachable_host_fails_loud(monkeypatch):
 
 @pytest.mark.parametrize(
     "outcome",
-    [pytest.param(TimeoutError("read timed out"), id="timeout"), pytest.param(ConnectionResetError(), id="reset")],
+    [
+        pytest.param(TimeoutError("read timed out"), id="timeout"),
+        pytest.param(ConnectionResetError(), id="reset"),
+        pytest.param(http.client.IncompleteRead(b"{"), id="truncated-body"),
+    ],
 )
 def test_a_dropped_connection_fails_loud(monkeypatch, outcome):
     _urlopen_answering(monkeypatch, [outcome])

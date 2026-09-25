@@ -40,16 +40,13 @@ class Case:
 def historical_cases(history: Path, labels_path: Path | None) -> list[Case]:
     """Every consecutive pinned pair under `history`, labelled; pairs labelled null are left out.
 
-    The labels file is `{"pairs": [{"resource", "from", "to", "label"}, ...]}`;
-    naming a pair that is not consecutive in the tree is an error, so a stale
-    label cannot silently stop applying.
+    The labels file is `{"pairs": [{"resource", "from", "to", "label"}, ...]}`,
+    each label one of `BUMPS` or null. Naming a pair twice, or a pair that is
+    not consecutive in the tree, is an error, so a stale label cannot silently
+    stop applying. So is a pair with nothing to classify: every case is checked
+    here, before the paid run starts.
     """
-    labels = {}
-    if labels_path is not None:
-        labels = {
-            (entry["resource"], entry["from"], entry["to"]): entry["label"]
-            for entry in json.loads(labels_path.read_text())["pairs"]
-        }
+    labels = _load_labels(labels_path) if labels_path is not None else {}
     cases: list[Case] = []
     seen: set[tuple[str, str, str]] = set()
     for directory in sorted(p for p in history.iterdir() if p.is_dir()):
@@ -64,11 +61,34 @@ def historical_cases(history: Path, labels_path: Path | None) -> list[Case]:
                 continue
             old = json.loads((directory / f"{old_version}.json").read_text())
             new = json.loads((directory / f"{new_version}.json").read_text())
+            if not diff(old, new):
+                raise ValueError(f"{directory.name} {old_version}→{new_version} has nothing to classify; label it null")
             cases.append(Case("historical", f"{directory.name} {old_version}→{new_version}", old, new, label))
     stale = sorted(set(labels) - seen)
     if stale:
         raise ValueError(f"the labels file names pairs that are not consecutive pinned versions: {stale}")
     return cases
+
+
+_LABEL_KEYS = frozenset({"resource", "from", "to", "label"})
+
+
+def _load_labels(path: Path) -> dict[tuple[str, str, str], str | None]:
+    document = json.loads(path.read_text())
+    pairs = document.get("pairs") if isinstance(document, dict) else None
+    if not isinstance(pairs, list):
+        raise ValueError(f"{path}: not an object with a `pairs` list")
+    labels: dict[tuple[str, str, str], str | None] = {}
+    for entry in pairs:
+        if not isinstance(entry, dict) or entry.keys() != _LABEL_KEYS:
+            raise ValueError(f"{path}: a label needs exactly the keys {sorted(_LABEL_KEYS)}: {entry!r}")
+        if entry["label"] is not None and entry["label"] not in BUMPS:
+            raise ValueError(f"{path}: label {entry['label']!r} is not one of {BUMPS} or null")
+        key = (entry["resource"], entry["from"], entry["to"])
+        if key in labels:
+            raise ValueError(f"{path}: {key} is labelled more than once")
+        labels[key] = entry["label"]
+    return labels
 
 
 def synthetic_cases() -> list[Case]:

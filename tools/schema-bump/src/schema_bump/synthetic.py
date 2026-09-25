@@ -100,7 +100,7 @@ def _declare_on_open(schema: dict) -> None:
 
 
 PAIRS: list[Pair] = [
-    # Each CRITERIA example, in both directions.
+    # Structural changes, each paired with its reverse: loosening is minor, tightening major.
     *_both_ways("optional property added", lambda s: _props(s).update(note={"type": "string"}), "minor", "major"),
     *_both_ways("enum value added", lambda s: _props(s)["kind"]["enum"].append("c"), "minor", "major"),
     *_both_ways(
@@ -187,7 +187,7 @@ PAIRS: list[Pair] = [
     ),
     # Policy: a $defs name is addressable, so renaming one breaks.
     Pair("$defs entry renamed with its $refs", _base(), _edited(_rename_def), "major"),
-    # Annotations do not change what validates.
+    # Policy: tools act on a non-documentation annotation, so adding one is minor.
     Pair(
         "x-secret annotation added", _base(),
         _edited(lambda s: _props(s)["name"].update({"x-secret": True})), "minor",

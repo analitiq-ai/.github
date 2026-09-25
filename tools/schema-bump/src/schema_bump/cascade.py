@@ -12,6 +12,7 @@ them means re-running it.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import time
 import urllib.error
@@ -114,7 +115,7 @@ class Decision:
 
 
 def openrouter_post(api_key: str, *, sleep: Callable[[float], None] = time.sleep) -> Post:
-    """A `Post` that calls OpenRouter, retrying 429 and 5xx responses."""
+    """A `Post` that calls OpenRouter, retrying the statuses in `_RETRY_STATUSES`."""
 
     def post(url: str, payload: dict) -> tuple[int, Any]:
         request = urllib.request.Request(
@@ -131,7 +132,7 @@ def openrouter_post(api_key: str, *, sleep: Callable[[float], None] = time.sleep
             except urllib.error.HTTPError as error:
                 if error.code not in _RETRY_STATUSES or attempt == len(_RETRY_DELAYS):
                     return error.code, _error_body(error)
-            except OSError as error:
+            except (OSError, http.client.HTTPException) as error:
                 raise BumpClassificationError(f"cannot reach {url}: {error!r}") from error
             else:
                 try:
@@ -255,7 +256,7 @@ def _ask_jev(resource: str, diff: str, post: Post) -> tuple[dict, float]:
         cost = body["usage"]["cost"]
     except (KeyError, TypeError) as error:
         raise BumpClassificationError(f"Jev answer is missing {error}: {_brief(body)}") from error
-    if not _is_stage1(stage1):
+    if not _is_stage1(stage1) or not _is_cost(cost):
         raise BumpClassificationError(f"Jev answer is malformed: {_brief(body)}")
     return stage1, cost
 
@@ -267,6 +268,10 @@ def _error_code(body: Any) -> Any:
 
 def _is_probability(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1
+
+
+def _is_cost(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0
 
 
 def _ask_luna(payload: dict, post: Post) -> tuple[dict, float]:
@@ -290,6 +295,8 @@ def _ask_luna(payload: dict, post: Post) -> tuple[dict, float]:
         cost = body["usage"]["cost"]
     except (KeyError, IndexError, TypeError) as error:
         raise BumpClassificationError(f"Luna answer is missing {error}: {_brief(body)}") from error
+    if not _is_cost(cost):
+        raise BumpClassificationError(f"Luna reported a cost that is not a number: {_brief(body)}")
     if finish_reason != "stop":
         raise BumpClassificationError(f"Luna stopped with finish_reason {finish_reason!r}")
     if not isinstance(content, str) or not content:

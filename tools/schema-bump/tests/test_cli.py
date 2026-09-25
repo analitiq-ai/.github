@@ -77,6 +77,58 @@ def test_eval_refuses_a_count_below_one_before_any_call(monkeypatch, flag, count
 
 def test_eval_refuses_labels_without_a_history(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(evaluation, "run", lambda *a: pytest.fail("no run expected"))
+    labels = tmp_path / "labels.json"
+    labels.write_text(json.dumps({"pairs": []}))
     with pytest.raises(SystemExit) as refused:
-        cli.main(["eval", "--labels", str(tmp_path / "labels.json")])
+        cli.main(["eval", "--labels", str(labels)])
     assert refused.value.code == 2
+
+
+@pytest.mark.parametrize("version", ["1.0", "v1.0.0", "latest"])
+def test_decide_refuses_a_version_that_is_not_semver_before_any_call(files, monkeypatch, version):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(cascade, "openrouter_post", lambda api_key: pytest.fail("no call expected"))
+    with pytest.raises(SystemExit) as refused:
+        cli.main(["decide", "--resource", "probe", "--from-version", version,
+                  "--old", files["old"], "--new", files["new"]])
+    assert refused.value.code == 2
+
+
+@pytest.mark.parametrize("flag", ["--from-version", "--to-version"])
+def test_verify_refuses_a_version_that_is_not_semver(files, tmp_path, flag):
+    record = tmp_path / "record.json"
+    record.write_text("{}")
+    versions = {"--from-version": "1.0.0", "--to-version": "1.1.0", flag: "1.1"}
+    argv = ["verify", "--record", str(record), "--resource", "probe", "--old", files["old"], "--new", files["new"]]
+    with pytest.raises(SystemExit) as refused:
+        cli.main([*argv, *(arg for pair in versions.items() for arg in pair)])
+    assert refused.value.code == 2
+
+
+def test_eval_refuses_a_history_that_is_not_a_directory(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(cascade, "openrouter_post", lambda api_key: pytest.fail("no call expected"))
+    with pytest.raises(SystemExit) as refused:
+        cli.main(["eval", "--history", str(tmp_path / "missing")])
+    assert refused.value.code == 2
+
+
+def test_eval_refuses_a_labels_file_that_does_not_exist(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(cascade, "openrouter_post", lambda api_key: pytest.fail("no call expected"))
+    with pytest.raises(SystemExit) as refused:
+        cli.main(["eval", "--history", str(tmp_path), "--labels", str(tmp_path / "missing.json")])
+    assert refused.value.code == 2
+
+
+def test_eval_exits_2_on_a_corpus_it_cannot_load(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(cascade, "openrouter_post", lambda api_key: pytest.fail("no call expected"))
+    labels = tmp_path / "labels.json"
+    labels.write_text(json.dumps({"pairs": [{"resource": "a", "from": "1.0.0", "to": "9.0.0", "label": "major"}]}))
+    assert cli.main(["eval", "--history", str(tmp_path), "--labels", str(labels)]) == 2
+
+
+def test_eval_exits_2_when_a_case_cannot_be_classified(models):
+    models.extend((cascade.JEV_URL, 503, {}) for _ in range(1000))
+    assert cli.main(["eval", "--runs", "1", "--workers", "1"]) == 2
