@@ -17,9 +17,9 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
 
 from . import cascade, evaluation
+from .inputs import read_json_object
 from .record import NoChange, decide_record, record_problem
 from .semver import BUMPS, parse_semver
 
@@ -61,14 +61,10 @@ def _output_file(text: str) -> Path:
 
 
 def _json_object(text: str) -> dict:
-    path = Path(text)
     try:
-        value: Any = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as error:
-        raise argparse.ArgumentTypeError(f"{text}: {error}") from error
-    if not isinstance(value, dict):
-        raise argparse.ArgumentTypeError(f"{text}: not a JSON object")
-    return value
+        return read_json_object(Path(text))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 def _api_key() -> str | None:

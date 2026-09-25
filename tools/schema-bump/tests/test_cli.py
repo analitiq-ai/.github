@@ -5,9 +5,9 @@ import json
 from pathlib import Path
 
 import pytest
+from test_record import NEW, OLD, answering, confident
 
 from schema_bump import cascade, cli, evaluation
-from test_record import NEW, OLD, answering, confident
 
 
 @pytest.fixture
@@ -43,6 +43,15 @@ def test_decide_prints_a_record_that_verify_accepts(files, models, capsys, tmp_p
             "--old", files["old"], "--new", files["new"]]
     assert cli.main([*argv, "--to-version", "1.1.0"]) == 0
     assert cli.main([*argv, "--to-version", "2.0.0"]) == 1
+
+
+@pytest.mark.parametrize("content", [b"\xff\xfe not utf-8", b"{not json", b"[]"])
+def test_an_unreadable_schema_is_refused_with_its_reason_before_any_call(files, models, capsys, content):
+    Path(files["old"]).write_bytes(content)
+    with pytest.raises(SystemExit) as exit_:
+        _decide(files)
+    assert exit_.value.code == 2
+    assert f"{files['old']}: " in capsys.readouterr().err
 
 
 def test_decide_exits_3_when_nothing_changed(files, models):

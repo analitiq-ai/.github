@@ -14,7 +14,6 @@ change this evaluation must be re-run for.
 """
 from __future__ import annotations
 
-import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +21,7 @@ from typing import Any, Callable
 
 from . import cascade
 from .diff import diff
+from .inputs import read_json_object
 from .semver import BUMPS, SEMVER_RE, bump_between, parse_semver
 from .synthetic import PAIRS as SYNTHETIC_PAIRS
 
@@ -61,8 +61,8 @@ def historical_cases(history: Path, labels_path: Path | None) -> list[Case]:
             if label is None:
                 continue
             name = f"{directory.name} {old_version}→{new_version}"
-            old = _read_object(directory / f"{old_version}.json")
-            new = _read_object(directory / f"{new_version}.json")
+            old = read_json_object(directory / f"{old_version}.json")
+            new = read_json_object(directory / f"{new_version}.json")
             if not diff(old, new):
                 raise ValueError(f"{name} has nothing to classify; label it null")
             cases.append(Case("historical", name, old, new, label))
@@ -70,20 +70,6 @@ def historical_cases(history: Path, labels_path: Path | None) -> list[Case]:
     if stale:
         raise ValueError(f"the labels file names pairs that are not consecutive pinned versions: {stale}")
     return cases
-
-
-def _read_json(path: Path) -> Any:
-    try:
-        return json.loads(path.read_text())
-    except (OSError, ValueError) as error:
-        raise ValueError(f"{path}: cannot be read as JSON: {error}") from error
-
-
-def _read_object(path: Path) -> dict:
-    document = _read_json(path)
-    if not isinstance(document, dict):
-        raise ValueError(f"{path}: not a JSON object")
-    return document
 
 
 _LABEL_KEYS = frozenset({"resource", "from", "to", "label"})
@@ -101,8 +87,7 @@ def _label_problem(entry: Any) -> str | None:
 
 
 def _load_labels(path: Path) -> dict[tuple[str, str, str], str | None]:
-    document = _read_json(path)
-    pairs = document.get("pairs") if isinstance(document, dict) else None
+    pairs = read_json_object(path).get("pairs")
     if not isinstance(pairs, list):
         raise ValueError(f"{path}: not an object with a `pairs` list")
     labels: dict[tuple[str, str, str], str | None] = {}
