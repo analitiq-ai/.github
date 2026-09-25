@@ -1,14 +1,14 @@
 'use strict';
 
-// Turns two facts no GitHub check can observe on its own into commit statuses
-// on a PR's head, so a ruleset can require them:
+// Turns two facts no GitHub check can observe on its own into App-signed check
+// runs on a PR's head, so a ruleset can require them:
 //
 //   codex-review     Codex reviewed THIS commit and found nothing major.
 //   internal-review  Analitiq-Bot attested a clean internal review of THIS
 //                    commit (verifiable only as far as author + SHA).
 //
 // A version-only release PR (see versionOnlyRelease) passes both without
-// either review; both statuses then read "version-only release: OLD → NEW".
+// either review; both runs then title "version-only release: OLD → NEW".
 //
 // Both are bound to a SHA for the same reason: a push moves the head, and a
 // verdict for the old head must stop counting without anyone remembering to
@@ -51,18 +51,23 @@ const ATTESTATION_MARKER = '<!-- analitiq-internal-review -->';
 // shell, where backticks are the first thing to get mangled.
 const ATTESTED_COMMIT = /\*{0,2}Reviewed commit:\*{0,2}\s*[`'"]?([0-9a-f]{10,40})/gi;
 
-const MAX_STATUS_DESCRIPTION = 140;
-// GitHub rejects a longer status description, and one carrying a character
-// outside the BMP ("Description doesn't accept 4-byte Unicode") — which is what
-// 👍 and 👀 are. The gate words its own descriptions to fit; an error's
-// message is not its to word, so every description is repaired here, at the one
-// boundary they all cross. Repairing before the cut leaves no surrogate pair for
-// it to split.
-const postable = (description) => description.replace(/[^\u{0}-\u{FFFF}]/gu, '?').slice(0, MAX_STATUS_DESCRIPTION);
+// This App's own slug. post() checks a freshly created run's response against
+// it, so a caller running this script with a token from the wrong App fails
+// loud instead of posting under a name a ruleset won't recognize; newestRun
+// uses it only as the gate's own re-post dedup (see the README's Limits
+// section for what actually stops a forged same-named run from another
+// actor).
+const GATE_APP_SLUG = 'analitiq-pr-gate';
+
+const MAX_TITLE_LENGTH = 255;
+// GitHub rejects a longer check-run title. The gate words its own successes,
+// waivers and pendings to fit; an error's message is not its to word, so
+// every title is capped here, at the one boundary they all cross.
+const fitsTitle = (title) => title.slice(0, MAX_TITLE_LENGTH);
 
 // The gate's wording around an error it did not write. Named so a test builds the
 // crash text from here instead of keeping its own copy; what a crash posts is
-// this, repaired by postable.
+// this, capped by fitsTitle.
 const crashDescription = (error) => `pr-gate failed: ${error}`;
 
 const short = (sha) => sha.slice(0, 10);
@@ -435,31 +440,60 @@ async function readRelease({ github, owner, repo, pr }) {
   return versionOnlyRelease({ files, read });
 }
 
-// Newest first, which is the order the API returns and `history` keeps.
-const newest = (history, context) => history.find((s) => s.context === context);
+// The three states the gate's own logic ever returns. `conclusion` is absent
+// for `pending`: a run still `in_progress` has none to report.
+const CHECK_RUN_STATE = {
+  success: { status: 'completed', conclusion: 'success' },
+  error: { status: 'completed', conclusion: 'failure' },
+  pending: { status: 'in_progress' },
+};
 
-async function post({ github, core, owner, repo, pr, history, context, status }) {
-  const current = newest(history, context);
-  // Compared, posted and logged as the API will hold it, so an unchanged status
+// The App's own newest run of this name, or undefined. Check runs are not
+// returned newest-first the way commit statuses were, so they are compared by
+// when each started, with a tie broken by the higher id: GitHub hands out
+// check-run ids monotonically, so two runs sharing a started_at are still
+// ordered. A same-named run from another app is not this gate's history at
+// all.
+function newestRun(history, name) {
+  return history
+    .filter((run) => run.name === name && run.app?.slug === GATE_APP_SLUG)
+    .reduce((latest, run) => {
+      if (latest === undefined) return run;
+      const runAt = timestamp(run.started_at, `check run ${run.id}`);
+      const latestAt = timestamp(latest.started_at, `check run ${latest.id}`);
+      if (runAt !== latestAt) return runAt > latestAt ? run : latest;
+      return run.id > latest.id ? run : latest;
+    }, undefined);
+}
+
+async function post({ github, core, owner, repo, pr, history, name, status, runUrl }) {
+  const run = CHECK_RUN_STATE[status.state];
+  if (run === undefined) throw new Error(`pr-gate produced an unknown state: ${JSON.stringify(status.state)}`);
+  // Compared, posted and logged as the API will hold it, so an unchanged run
   // still reads as unchanged next run.
-  const description = postable(status.description);
-  // GitHub keeps at most 1000 statuses per commit and context, after which it
-  // refuses new ones; a sweep re-posting an unchanged status every run would
-  // spend that in days and leave the gate unable to ever report again.
-  if (current && current.state === status.state && current.description === description) {
-    core.info(`PR #${pr.number} @ ${short(pr.head.sha)}: ${context} already ${status.state}`);
+  const title = fitsTitle(status.description);
+  const current = newestRun(history, name);
+  if (current && current.status === run.status && (current.conclusion ?? undefined) === run.conclusion && current.output?.title === title) {
+    core.info(`PR #${pr.number} @ ${short(pr.head.sha)}: ${name} already ${status.state}`);
     return;
   }
-  await github.rest.repos.createCommitStatus({
+  const { data } = await github.rest.checks.create({
     owner,
     repo,
-    sha: pr.head.sha,
-    context,
-    state: status.state,
-    description,
-    target_url: pr.html_url,
+    name,
+    head_sha: pr.head.sha,
+    details_url: runUrl,
+    output: { title, summary: status.description },
+    ...run,
   });
-  core.info(`PR #${pr.number} @ ${short(pr.head.sha)}: ${context} -> ${status.state} (${description})`);
+  // Whatever the token's owner meant to be, the run it just created belongs to
+  // whichever App the token actually authenticated as; a caller running this
+  // script with the wrong token would otherwise post a run silently ignored
+  // by any ruleset that requires the real App.
+  if (data.app?.slug !== GATE_APP_SLUG) {
+    throw new Error(`checks.create posted as '${data.app?.slug}', not the ${GATE_APP_SLUG} App`);
+  }
+  core.info(`PR #${pr.number} @ ${short(pr.head.sha)}: ${name} -> ${status.state} (${title})`);
 }
 
 async function readStatuses({ github, core, owner, repo, pr }) {
@@ -531,29 +565,29 @@ async function readStatuses({ github, core, owner, repo, pr }) {
   };
 }
 
-async function evaluateHead({ github, core, owner, repo, pr, history }) {
+async function evaluateHead({ github, core, owner, repo, pr, history, runUrl }) {
   let wanted = await readStatuses({ github, core, owner, repo, pr });
 
-  // Statuses are last-writer-wins, and the sweep runs outside the per-PR
+  // Runs are last-writer-wins, and the sweep runs outside the per-PR
   // concurrency group. A run working from a snapshot taken before a verdict
   // landed would overwrite a newer success (or race past it on a brand-new
   // head), so a demotion or a first pending is re-derived from a fresh read
   // right before posting. That narrows the race; it does not close it.
-  const aboutToDemote = Object.entries(wanted).some(([context, status]) => {
-    const current = newest(history, context);
-    return status.state !== 'success' && (!current || current.state === 'success');
+  const aboutToDemote = Object.entries(wanted).some(([name, status]) => {
+    const current = newestRun(history, name);
+    return status.state !== 'success' && (!current || current.conclusion === 'success');
   });
   if (aboutToDemote) {
     wanted = await readStatuses({ github, core, owner, repo, pr });
   }
 
-  for (const [context, status] of Object.entries(wanted)) {
+  for (const [name, status] of Object.entries(wanted)) {
     if (status.notice) core.notice(`PR #${pr.number}: ${status.notice}`);
-    await post({ github, core, owner, repo, pr, history, context, status });
+    await post({ github, core, owner, repo, pr, history, name, status, runUrl });
   }
 }
 
-async function evaluate({ github, core, owner, repo, prNumber }) {
+async function evaluate({ github, core, owner, repo, prNumber, runUrl }) {
   const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
   if (pr.state !== 'open') {
     core.info(`PR #${prNumber} is ${pr.state}; nothing to gate`);
@@ -562,48 +596,63 @@ async function evaluate({ github, core, owner, repo, prNumber }) {
 
   let history = [];
   try {
-    history = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+    // The App's own check runs on this head are what newestRun compares
+    // against; the app.slug filter that keeps another actor's same-named run
+    // out of that comparison lives there, next to the comparison it decides.
+    history = await github.paginate(github.rest.checks.listForRef, {
       owner,
       repo,
       ref: pr.head.sha,
       per_page: 100,
     });
-    await evaluateHead({ github, core, owner, repo, pr, history });
+    await evaluateHead({ github, core, owner, repo, pr, history, runUrl });
   } catch (error) {
     // Surface the crash on the PR itself: a run that dies here is otherwise
     // visible only in the Actions tab, and the author would read the stuck
     // gate as "the reviewer is slow". The error state still blocks merge. Both
-    // contexts: they are derived together, so after a failure neither is known
+    // names: they are derived together, so after a failure neither is known
     // to be current.
     const status = { state: 'error', description: crashDescription(error) };
-    for (const context of [CODEX_CONTEXT, INTERNAL_CONTEXT]) {
+    for (const name of [CODEX_CONTEXT, INTERNAL_CONTEXT]) {
       try {
-        await post({ github, core, owner, repo, pr, history, context, status });
-      } catch (statusError) {
-        core.error(`PR #${prNumber}: could not post ${context} error status: ${statusError.stack || statusError}`);
+        await post({ github, core, owner, repo, pr, history, name, status, runUrl });
+      } catch (postError) {
+        core.error(`PR #${prNumber}: could not post ${name} check run: ${postError.stack || postError}`);
       }
     }
     throw error;
   }
 }
 
-// Entry point for actions/github-script. The schedule's sweep is the retry net
-// for event runs that failed or were never delivered, and the only trigger
-// guaranteed to follow a verdict delivered as a PR review, since review events
-// must never trigger this (see pr-gate.yml). A repository_dispatch sweeps too:
-// a reaction triggers nothing, so whoever sees Codex's 👍 dispatches one rather
+// The four events that run this workflow file from the default branch (see
+// "Wiring it into a consumer repo" in the README). Anything else would run a
+// branch's copy of the caller with its write token; refusing here cannot
+// prevent that, but makes a consumer who wires such a trigger by mistake fail
+// on the first run.
+const ALLOWED_EVENTS = ['pull_request_target', 'issue_comment', 'schedule', 'repository_dispatch'];
+
+// Entry point for the shared composite action. The schedule's sweep is the
+// retry net for event runs that failed or were never delivered, and the only
+// trigger guaranteed to follow a verdict delivered as a PR review, since
+// review events must never trigger this. A repository_dispatch sweeps too: a
+// reaction triggers nothing, so whoever sees Codex's 👍 dispatches one rather
 // than wait for the next scheduled sweep.
 async function run({ github, context, core }) {
+  if (!ALLOWED_EVENTS.includes(context.eventName)) {
+    throw new Error(`pr-gate must not be triggered by '${context.eventName}'`);
+  }
+
   const { owner, repo } = context.repo;
   const { pull_request: pullRequest, issue } = context.payload;
+  const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
 
   if (pullRequest) {
-    await evaluate({ github, core, owner, repo, prNumber: pullRequest.number });
+    await evaluate({ github, core, owner, repo, prNumber: pullRequest.number, runUrl });
     return;
   }
   if (issue) {
     if (issue.pull_request) {
-      await evaluate({ github, core, owner, repo, prNumber: issue.number });
+      await evaluate({ github, core, owner, repo, prNumber: issue.number, runUrl });
     } else {
       core.info(`#${issue.number} is an issue, not a PR; nothing to gate`);
     }
@@ -615,7 +664,7 @@ async function run({ github, context, core }) {
   const failures = [];
   for (const pr of open) {
     try {
-      await evaluate({ github, core, owner, repo, prNumber: pr.number });
+      await evaluate({ github, core, owner, repo, prNumber: pr.number, runUrl });
     } catch (error) {
       // One broken PR must not starve the rest.
       failures.push(`#${pr.number}: ${error}`);
@@ -631,8 +680,6 @@ module.exports = {
   codexStatus,
   crashDescription,
   internalReviewStatus,
-  postable,
   versionOnlyRelease,
-  MAX_STATUS_DESCRIPTION,
   run,
 };
