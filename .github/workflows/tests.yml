@@ -17,3 +17,13 @@ jobs:
         with:
           node-version: 22
       - run: node --test
+
+  schema-bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e 'tools/schema-bump[test]'
+      - run: pytest tools/schema-bump

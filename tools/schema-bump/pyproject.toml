@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "analitiq-schema-bump"
+version = "1.0.0"
+description = "Model-decided semantic-version bumps for published JSON Schemas, with offline-verifiable records."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8", "jsonschema>=4.18"]
+
+[project.scripts]
+schema-bump = "schema_bump.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

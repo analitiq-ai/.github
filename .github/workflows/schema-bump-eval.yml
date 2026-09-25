@@ -1,0 +1,84 @@
+name: Schema bump evaluation (reusable)
+
+# Runs `schema-bump eval` (tools/schema-bump) in a caller's checkout: the
+# synthetic corpus the tool ships, plus the caller's own published history.
+# Paid, so dispatch only. Any ref is allowed: a change to the tool pin is
+# evaluated on its branch before it merges.
+
+on:
+  workflow_call:
+    inputs:
+      setup-command:
+        description: Installs the caller's dependencies, including the schema-bump version it pins.
+        type: string
+        required: true
+      history:
+        description: A tree of <resource>/X.Y.Z.json pinned versions; empty runs the synthetic corpus only.
+        type: string
+        default: ""
+      labels:
+        description: A labels file overriding the published bump of historical pairs.
+        type: string
+        default: ""
+      runs:
+        type: number
+        default: 3
+      python-version:
+        type: string
+        default: "3.12"
+    secrets:
+      OPEN_ROUTER_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse anything but a dispatch
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" != workflow_dispatch ]; then
+            echo "::error::schema-bump-eval must not be triggered by '$EVENT'"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Set up
+        env:
+          SETUP_COMMAND: ${{ inputs.setup-command }}
+        run: bash -euo pipefail -c "$SETUP_COMMAND"
+
+      - name: Evaluate
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_KEY }}
+          HISTORY: ${{ inputs.history }}
+          LABELS: ${{ inputs.labels }}
+          RUNS: ${{ inputs.runs }}
+        run: |
+          args=(--runs "$RUNS" --out "$RUNNER_TEMP/schema-bump-eval.json")
+          if [ -n "$HISTORY" ]; then args+=(--history "$HISTORY"); fi
+          if [ -n "$LABELS" ]; then args+=(--labels "$LABELS"); fi
+          schema-bump eval "${args[@]}" 2>&1 | tee "$RUNNER_TEMP/schema-bump-eval.log"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: schema-bump-eval
+          path: |
+            ${{ runner.temp }}/schema-bump-eval.json
+            ${{ runner.temp }}/schema-bump-eval.log
