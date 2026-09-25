@@ -407,9 +407,13 @@ re-running the evaluation (below) before a caller adopts the new version.
 The caller owns rendering, file layout and the `$id`/`version` stamps. The tool
 never learns a repo's layout.
 
-- **Pin the tool once**, as a dependency its setup installs:
-  `analitiq-schema-bump @ git+https://github.com/analitiq-ai/.github@<sha>#subdirectory=tools/schema-bump`.
-  Import it (`schema_bump.record.decide_record` / `record_problem`), or call
+- **Pin one SHA of this repo** for both the tool and the workflows. The
+  setup installs the tool at it:
+  `analitiq-schema-bump @ git+https://github.com/analitiq-ai/.github@<sha>#subdirectory=tools/schema-bump`,
+  and every `uses:` line names the same `<sha>`, so a workflow never runs a
+  tool it was not written for. GitHub does not expand expressions in `uses:`,
+  so the SHA is repeated there literally; the caller's CI should fail when
+  the copies differ. Import the tool (`schema_bump.record.decide_record` / `record_problem`), or call
   the `schema-bump` CLI.
 - **The release command** renders every schema. For each one whose diff
   against its latest published version is not empty, it decides the bump and
@@ -439,7 +443,7 @@ permissions:
 
 jobs:
   release:
-    uses: analitiq-ai/.github/.github/workflows/schema-release.yml@main
+    uses: analitiq-ai/.github/.github/workflows/schema-release.yml@<sha>
     with:
       setup-command: pip install -r requirements-dev.txt
       release-command: python scripts/render_schemas.py release
@@ -473,7 +477,7 @@ permissions:
 
 jobs:
   eval:
-    uses: analitiq-ai/.github/.github/workflows/schema-bump-eval.yml@main
+    uses: analitiq-ai/.github/.github/workflows/schema-bump-eval.yml@<sha>
     with:
       setup-command: pip install -r requirements-dev.txt
       history: schemas
