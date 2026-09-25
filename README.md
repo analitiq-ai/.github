@@ -482,14 +482,13 @@ jobs:
       OPEN_ROUTER_KEY: ${{ secrets.OPEN_ROUTER_KEY }}
 ```
 
-The evaluation runs the cascade three times by default, over two sets of
-schema pairs:
+The evaluation runs the cascade `runs` times over two sets of schema pairs:
 
 - the synthetic pairs in `tools/schema-bump`, each with a known bump;
 - every consecutive pair of versions under `history`. Each is labelled with
-  the bump it was published with, unless the labels file
-  (`{"pairs": [{"resource", "from", "to", "label"}]}`, where a `null` label
-  leaves the pair out) says otherwise.
+  the bump it was published with, unless the labels file relabels it or, with
+  a null label, leaves it out. The `historical_cases` docstring in
+  `tools/schema-bump/src/schema_bump/evaluation.py` states the file's format.
 
 It fails on any under-bump, or on any stage-1 miss at or above the confidence
 floor. Results are uploaded as the `schema-bump-eval` artifact. It is paid, so
