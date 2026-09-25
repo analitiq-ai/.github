@@ -53,6 +53,13 @@ def _file(text: str) -> Path:
     return path
 
 
+def _output_file(text: str) -> Path:
+    path = Path(text)
+    if not path.parent.is_dir():
+        raise argparse.ArgumentTypeError(f"{text}: {path.parent} is not a directory")
+    return path
+
+
 def _json_object(text: str) -> dict:
     path = Path(text)
     try:
@@ -118,7 +125,11 @@ def _eval(args: argparse.Namespace) -> int:
         print(f"the evaluation stopped: {error}", file=sys.stderr)
         return 2
     if args.out:
-        args.out.write_text(json.dumps(results, indent=2) + "\n")
+        try:
+            args.out.write_text(json.dumps(results, indent=2) + "\n")
+        except OSError as error:
+            print(f"the results could not be written: {error}", file=sys.stderr)
+            return 2
     return 0 if ok else 1
 
 
@@ -149,7 +160,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--labels", type=_file, help="labels overriding the published bump of historical pairs")
     run.add_argument("--runs", type=_positive_int, default=3)
     run.add_argument("--workers", type=_positive_int, default=8)
-    run.add_argument("--out", type=Path, help="write every scored result as JSON here")
+    run.add_argument("--out", type=_output_file, help="write every scored result as JSON here")
     run.set_defaults(func=_eval)
 
     args = parser.parse_args(argv)

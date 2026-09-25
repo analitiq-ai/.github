@@ -18,7 +18,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from . import cascade
 from .diff import diff
@@ -40,11 +40,12 @@ class Case:
 def historical_cases(history: Path, labels_path: Path | None) -> list[Case]:
     """Every consecutive pinned pair under `history`, labelled; pairs labelled null are left out.
 
-    The labels file is `{"pairs": [{"resource", "from", "to", "label"}, ...]}`,
-    each label one of `BUMPS` or null. Naming a pair twice, or a pair that is
-    not consecutive in the tree, is an error, so a stale label cannot silently
-    stop applying. So is a pair with nothing to classify: every case is checked
-    here, before the paid run starts.
+    The labels file is `{"pairs": [{"resource", "from", "to", "label", "rationale"?}, ...]}`,
+    each label one of `BUMPS` or null. Every input is checked here, before the
+    paid run starts, and any defect raises ValueError: an unreadable or
+    malformed file, a pair labelled twice, a label naming a pair that is not
+    consecutive in the tree (so a stale label cannot silently stop applying),
+    and a scored pair with nothing to classify.
     """
     labels = _load_labels(labels_path) if labels_path is not None else {}
     cases: list[Case] = []
@@ -59,31 +60,55 @@ def historical_cases(history: Path, labels_path: Path | None) -> list[Case]:
             label = labels.get(key, bump_between(old_version, new_version))
             if label is None:
                 continue
-            old = json.loads((directory / f"{old_version}.json").read_text())
-            new = json.loads((directory / f"{new_version}.json").read_text())
+            name = f"{directory.name} {old_version}→{new_version}"
+            old = _read_object(directory / f"{old_version}.json")
+            new = _read_object(directory / f"{new_version}.json")
             if not diff(old, new):
-                raise ValueError(f"{directory.name} {old_version}→{new_version} has nothing to classify; label it null")
-            cases.append(Case("historical", f"{directory.name} {old_version}→{new_version}", old, new, label))
+                raise ValueError(f"{name} has nothing to classify; label it null")
+            cases.append(Case("historical", name, old, new, label))
     stale = sorted(set(labels) - seen)
     if stale:
         raise ValueError(f"the labels file names pairs that are not consecutive pinned versions: {stale}")
     return cases
 
 
+def _read_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError) as error:
+        raise ValueError(f"{path}: cannot be read as JSON: {error}") from error
+
+
+def _read_object(path: Path) -> dict:
+    document = _read_json(path)
+    if not isinstance(document, dict):
+        raise ValueError(f"{path}: not a JSON object")
+    return document
+
+
 _LABEL_KEYS = frozenset({"resource", "from", "to", "label"})
+_OPTIONAL_LABEL_KEYS = frozenset({"rationale"})
+
+
+def _label_problem(entry: Any) -> str | None:
+    if not isinstance(entry, dict) or not _LABEL_KEYS <= entry.keys() <= _LABEL_KEYS | _OPTIONAL_LABEL_KEYS:
+        return f"needs the keys {sorted(_LABEL_KEYS)}, and may carry {sorted(_OPTIONAL_LABEL_KEYS)}"
+    if not all(isinstance(entry[key], str) for key in ("resource", "from", "to", *entry.keys() & {"rationale"})):
+        return "needs string values for resource, from, to and rationale"
+    if entry["label"] is not None and entry["label"] not in BUMPS:
+        return f"needs a label in {BUMPS} or null"
+    return None
 
 
 def _load_labels(path: Path) -> dict[tuple[str, str, str], str | None]:
-    document = json.loads(path.read_text())
+    document = _read_json(path)
     pairs = document.get("pairs") if isinstance(document, dict) else None
     if not isinstance(pairs, list):
         raise ValueError(f"{path}: not an object with a `pairs` list")
     labels: dict[tuple[str, str, str], str | None] = {}
     for entry in pairs:
-        if not isinstance(entry, dict) or entry.keys() != _LABEL_KEYS:
-            raise ValueError(f"{path}: a label needs exactly the keys {sorted(_LABEL_KEYS)}: {entry!r}")
-        if entry["label"] is not None and entry["label"] not in BUMPS:
-            raise ValueError(f"{path}: label {entry['label']!r} is not one of {BUMPS} or null")
+        if problem := _label_problem(entry):
+            raise ValueError(f"{path}: the label {entry!r} {problem}")
         key = (entry["resource"], entry["from"], entry["to"])
         if key in labels:
             raise ValueError(f"{path}: {key} is labelled more than once")

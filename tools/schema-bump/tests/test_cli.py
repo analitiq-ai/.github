@@ -121,6 +121,23 @@ def test_eval_refuses_a_labels_file_that_does_not_exist(monkeypatch, tmp_path: P
     assert refused.value.code == 2
 
 
+def test_eval_refuses_an_out_file_in_a_missing_directory_before_any_call(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(cascade, "openrouter_post", lambda api_key: pytest.fail("no call expected"))
+    with pytest.raises(SystemExit) as refused:
+        cli.main(["eval", "--out", str(tmp_path / "missing" / "results.json")])
+    assert refused.value.code == 2
+
+
+def test_eval_exits_2_when_the_results_cannot_be_written(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(cascade, "openrouter_post", lambda api_key: None)
+    monkeypatch.setattr(evaluation, "run", lambda *a: (True, []))
+    out = tmp_path / "results.json"
+    out.mkdir()
+    assert cli.main(["eval", "--out", str(out)]) == 2
+
+
 def test_eval_exits_2_on_a_corpus_it_cannot_load(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setattr(cascade, "openrouter_post", lambda api_key: pytest.fail("no call expected"))

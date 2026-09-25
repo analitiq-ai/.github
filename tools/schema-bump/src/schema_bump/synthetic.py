@@ -122,6 +122,7 @@ PAIRS: list[Pair] = [
         "const replaced by a pattern that includes it",
         lambda s: _props(s).update(mode={"type": "string", "pattern": "^fast"}), "minor", "major",
     ),
+    # One-directional structural changes.
     Pair(
         "property renamed", _base(),
         _edited(lambda s: _props(s).update(title=_props(s).pop("name"))), "major",

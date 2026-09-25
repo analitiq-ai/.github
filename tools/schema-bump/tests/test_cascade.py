@@ -125,6 +125,7 @@ def _content(text):
         pytest.param((200, _luna_with(lambda b: b.pop("choices"))), id="no-choices"),
         pytest.param((200, _luna_with(lambda b: b["usage"].__setitem__("cost", "0.01"))), id="cost-not-a-number"),
         pytest.param((200, _luna_with(lambda b: b["usage"].__setitem__("cost", True))), id="cost-a-bool"),
+        pytest.param((200, _luna_with(lambda b: b["usage"].__setitem__("cost", -0.01))), id="cost-negative"),
     ],
 )
 def test_a_malformed_luna_answer_fails_loud(luna):
@@ -150,6 +151,7 @@ def test_a_malformed_luna_answer_fails_loud(luna):
             id="confidence-out-of-range",
         ),
         pytest.param((200, {**_jev(0.9), "usage": {"cost": None}}), id="cost-not-a-number"),
+        pytest.param((200, {**_jev(0.9), "usage": {"cost": -0.01}}), id="cost-negative"),
     ],
 )
 def test_a_failed_jev_call_fails_loud(jev):

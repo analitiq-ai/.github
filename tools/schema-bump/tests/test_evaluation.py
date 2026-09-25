@@ -73,6 +73,11 @@ def test_a_label_for_a_pair_that_is_not_consecutive_fails(history, tmp_path):
         pytest.param({"resource": "a", "from": "1.0.0", "to": "1.1.0", "label": "huge"}, id="label-outside-bumps"),
         pytest.param({"resource": "a", "from": "1.0.0", "to": "1.1.0"}, id="no-label"),
         pytest.param({"resource": "a", "from": "1.0.0", "to": "1.1.0", "label": "minor", "x": 1}, id="extra-key"),
+        pytest.param({"resource": ["a"], "from": "1.0.0", "to": "1.1.0", "label": "minor"}, id="resource-not-a-string"),
+        pytest.param({"resource": "a", "from": 1, "to": "1.1.0", "label": "minor"}, id="version-not-a-string"),
+        pytest.param(
+            {"resource": "a", "from": "1.0.0", "to": "1.1.0", "label": "minor", "rationale": 3}, id="rationale-not-a-string",
+        ),
     ],
 )
 def test_a_malformed_label_fails_at_load(history, tmp_path, entry):
@@ -86,6 +91,34 @@ def test_a_labels_file_without_a_pairs_list_fails_at_load(history, tmp_path, doc
     path.write_text(json.dumps(document))
     with pytest.raises(ValueError):
         evaluation.historical_cases(history, path)
+
+
+def test_a_label_may_carry_its_rationale(history, tmp_path):
+    labels = _labels(tmp_path, {"resource": "a", "from": "1.0.0", "to": "1.1.0", "label": "major", "rationale": "why"})
+    assert ("a 1.0.0→1.1.0", "major") in [(c.name, c.label) for c in evaluation.historical_cases(history, labels)]
+
+
+@pytest.mark.parametrize("text", ["{", ""])
+def test_a_labels_file_that_is_not_json_fails_at_load(history, tmp_path, text):
+    path = tmp_path / "labels.json"
+    path.write_text(text)
+    with pytest.raises(ValueError):
+        evaluation.historical_cases(history, path)
+
+
+@pytest.mark.parametrize("text", ["{", "[]", "3"])
+def test_a_pinned_version_that_is_not_a_json_object_fails_at_load(history, text):
+    (history / "a" / "1.1.0.json").write_text(text)
+    with pytest.raises(ValueError):
+        evaluation.historical_cases(history, None)
+
+
+def test_an_unreadable_pinned_version_fails_at_load(history):
+    path = history / "a" / "1.1.0.json"
+    path.unlink()
+    path.mkdir()
+    with pytest.raises(ValueError):
+        evaluation.historical_cases(history, None)
 
 
 def test_a_pair_labelled_twice_fails_at_load(history, tmp_path):
